@@ -14,15 +14,15 @@ build reading `/mnt/c` stalls on every file. It's the single most common WSL2 co
 every edit-build-test loop that spans the two worlds.
 
 `wsldrive` makes that boundary disappear. It keeps the whole directory tree's metadata in RAM on the
-side that's reading, caches file contents, and moves bytes over a **Hyper-V socket** instead of the OS's
-network filesystem — so cross-boundary access runs **5–15× faster on reads** (more on metadata) than the
-paths Windows and WSL ship:
+side that's reading, caches file contents, and lets the kernel keep those pages warm behind it — so
+cross-boundary access runs **8–19× faster on reads** (more on metadata) than the paths Windows and WSL
+ship:
 
 |   | today (OS path) | with wsldrive | speedup |
 |---|--:|--:|--:|
-| **Windows reading WSL files** (read 3000 files) | 2856 ms (`\\wsl.localhost`) | 366 ms | **~8×** |
-| **WSL reading Windows files** (read 3000 files) | 5853 ms (`/mnt/c`) | 383 ms | **~15×** |
-| directory walk, either direction | 100–400 ms | ~12–39 ms | **~3–30×** |
+| **Windows reading WSL files** (read 3000 files) | 2132 ms (`\\wsl.localhost`) | 259 ms | **~8×** |
+| **WSL reading Windows files** (read 3000 files) | 4182 ms (`/mnt/c`, virtiofs) | 225 ms | **~19×** |
+| directory walk, either direction | 50–165 ms | 7–11 ms | **~7–15×** |
 
 Both directions are read-write and mount *alongside* the built-in paths — nothing to replace, no kernel
 driver of its own (WinFsp on Windows, libfuse3 in WSL). Full numbers in [`bench/RESULTS.md`](bench/RESULTS.md).
