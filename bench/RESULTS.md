@@ -227,3 +227,56 @@ Windows' reserved TCP ranges — they are dynamic, so read them off
 `netsh interface ipv4 show excludedportrange protocol=tcp` rather than assuming
 a fixed window; a reserved port shows up as `MOUNT FAILED`, because WSL2 honours
 the reservation too.
+
+## Re-measured 2026-09-05 (WSL 2.7.8.0, kernel 6.18.33.1)
+
+Everything above was measured on WSL kernel 6.6 before the mount-side caching
+work landed. Both sides of every comparison have moved since, so the whole table
+was taken again on an idle machine: 3000 files, warm medians of five runs,
+alternating the order of the two variants (see the ordering bias noted above).
+
+| | OS path | wsldrive | speedup |
+|---|--:|--:|--:|
+| **Direction A** read (Windows → WSL ext4) | 2132 ms (`\wsl.localhost`) | 259 ms | **8.2×** |
+| Direction A walk | 50 ms | 7.5 ms | 6.7× |
+| **Direction B** read (WSL → Windows NTFS) | 4182 ms (`/mnt/c`, virtiofs) | 225 ms | **18.6×** |
+| Direction B walk | 165 ms | 11 ms | 15× |
+
+The ratios the README claims still hold and are now conservative on Direction B.
+The absolute numbers all improved, from both directions at once:
+
+- **The OS paths got faster.** `\wsl.localhost` went 2856 → 2132 ms and
+  `/mnt/c` 5853 ms (9P) / 7686 ms (virtiofs) → 4182 ms (virtiofs), with no
+  change on our side. Newer WSL, not newer wsldrive.
+- **wsldrive got faster**, from the page-cache and connection work: Direction A
+  366 → 259 ms, Direction B 383 → 225 ms.
+
+### Direction B no longer needs the Hyper-V socket transport here
+
+This contradicts the finding recorded above, so it is worth stating plainly.
+Direction B used to be unusable over loopback TCP on this machine — each
+round-trip through WSL's localhost forwarding cost seconds, which is what made
+the Hyper-V socket transport necessary. On WSL 2.7.8.0, with the same
+`networkingMode=mirrored` configuration, a TCP round-trip is **0.224 ms**, and
+the Direction B figures above were measured over plain TCP with no hvsocket
+registration at all.
+
+That is one machine and one WSL version, so the hvsocket path stays and stays
+recommended; but the claim that Direction B *requires* it no longer holds here,
+and it is worth re-checking before treating hvsocket setup as mandatory.
+
+### The mutual handshake costs nothing measurable
+
+The handshake gained a third leg when both ends started authenticating each
+other. It is a per-connection cost, so no read or walk benchmark would show it.
+Timing connect + handshake + snapshot, 25 samples per round, three rounds
+alternating:
+
+| | median |
+|---|--:|
+| before (two legs) | 15 / 15 / 15 ms |
+| after (three legs, mutual) | 16 / 15 / 16 ms |
+
+One extra loopback round-trip and a BLAKE3 hash against ~15 ms of process start
+and snapshot transfer. A first pass over only 15 samples suggested 16 → 37 ms;
+that was noise (min 15, max 134) and did not survive more samples.
