@@ -28,6 +28,8 @@
 #include <csignal>
 #endif
 
+#include <algorithm>
+#include <optional>
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -60,7 +62,69 @@ DWORD run_quiet(std::wstring cmd) {
   return code;
 }
 
+// Starts a command without waiting for it. The caller kills it via the returned
+// handle; nullptr means it could not be started.
+HANDLE spawn_quiet(std::wstring cmd) {
+  cmd.push_back(L'\0');
+  STARTUPINFOW si{};
+  si.cb = sizeof(si);
+  PROCESS_INFORMATION pi{};
+  if (!::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
+    return nullptr;
+  ::CloseHandle(pi.hThread);
+  return pi.hProcess;
+}
 std::wstring widen(std::string_view s) { return wsld::platform::win::to_wide(s); }
+
+// Median round-trip time, in milliseconds, from inside the distro back to a
+// listener on Windows over loopback. std::nullopt if it could not be measured.
+//
+// This one number decides whether Direction B needs the Hyper-V socket
+// transport, and it cannot be inferred from the installed WSL version: a
+// running WSL2 VM keeps the kernel it booted with, so a machine can carry the
+// improvement for months without it taking effect. Two machines on identical
+// WSL versions can differ, which is why this measures rather than checks.
+//
+// Uses bash's /dev/tcp rather than our own binaries, so it works before
+// anything has been staged into the distro. The distro end is a plain echo
+// (`cat <&3 >&3`); all the timing happens here.
+std::optional<double> probe_loopback_rtt(const std::string& distro) {
+  auto listener = wsld::net::Listener::bind(*wsld::net::Endpoint::parse("tcp://127.0.0.1:0"));
+  if (!listener) return std::nullopt;
+  const std::uint16_t port = listener->local().port;
+  const std::wstring d = distro.empty() ? L"" : L" -d " + widen(distro);
+  HANDLE echo = spawn_quiet(L"wsl.exe" + d + L" -e bash -lc \"exec 3<>/dev/tcp/127.0.0.1/" +
+                            std::to_wstring(port) + L"; cat <&3 >&3\"");
+  std::optional<double> result;
+  if (auto peer = listener->accept(std::chrono::seconds(10))) {
+    std::vector<double> rtt;
+    std::byte out{std::byte{42}};
+    std::byte in{};
+    for (int i = 0; i < 20; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      if (!peer->send_all(std::span<const std::byte>(&out, 1))) break;
+      if (!peer->recv_exact(std::span<std::byte>(&in, 1))) break;
+      rtt.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+    if (rtt.size() >= 5) {
+      std::sort(rtt.begin(), rtt.end());
+      result = rtt[rtt.size() / 2];
+    }
+    peer->close();
+  }
+  if (echo != nullptr) {
+    ::TerminateProcess(echo, 0);
+    ::CloseHandle(echo);
+  }
+  listener->close();
+  return result;
+}
+
+// Below this, plain TCP is as good as the Hyper-V socket transport for
+// Direction B. The slow path was seconds per round-trip, not milliseconds, so
+// the threshold does not have to be delicate.
+constexpr double kFastLoopbackMs = 5.0;
+
 #endif
 
 void usage() {
@@ -69,7 +133,8 @@ void usage() {
       "usage:\n"
       "  wsldrive fetch (--connect <endpoint> | --listen <endpoint>) [--watch] [--read <path>] [--lookups N]\n"
 #ifdef _WIN32
-      "  wsldrive doctor [--distro X] [--hvsocket] [--port N] [--pause]\n"
+      "  wsldrive doctor [--distro X] [--hvsocket] [--port N] [--probe-transport] [--pause]\n"
+      "  wsldrive probe-transport [--distro X]              (loopback round-trip, ms; for scripts)\n"
       "                                                       (check the WinFsp + WSL environment)\n"
 #endif
 #ifdef WSLDRIVE_HAVE_MOUNT
@@ -130,17 +195,41 @@ int main(int argc, char** argv) {
   const std::string_view command = argc >= 2 ? std::string_view(argv[1]) : std::string_view{};
 
 #ifdef _WIN32
+  // Machine-readable form of doctor's transport probe, for the installer: prints
+  // the median round-trip in milliseconds and nothing else, exits 0 when it is
+  // fast enough for plain TCP and 1 when it is not (2 if it could not measure).
+  // The installer picks the Direction B transport from this rather than from a
+  // WSL version number, which would be wrong on any VM that has not restarted
+  // since its kernel updated.
+  if (command == "probe-transport") {
+    std::string distro;
+    for (int i = 2; i < argc; ++i) {
+      const std::string_view a = argv[i];
+      if (a == "--distro" && i + 1 < argc) distro = argv[++i];
+      else {
+        std::fprintf(stderr, "probe-transport: unknown option %.*s\n", static_cast<int>(a.size()), a.data());
+        return 2;
+      }
+    }
+    const auto rtt = probe_loopback_rtt(distro);
+    if (!rtt) return 2;
+    std::printf("%.3f\n", *rtt);
+    return *rtt < kFastLoopbackMs ? 0 : 1;
+  }
+
   if (command == "doctor") {
     // doctor [--distro X] [--hvsocket] [--port N] [--pause]
     std::string want_distro;
     int want_port = 0;
     bool check_hv = false;
+    bool probe_transport = false;
     bool pause_at_end = false;
     for (int i = 2; i < argc; ++i) {
       const std::string_view a = argv[i];
       if (a == "--distro" && i + 1 < argc) want_distro = argv[++i];
       else if (a == "--port" && i + 1 < argc) want_port = std::atoi(argv[++i]);
       else if (a == "--hvsocket") check_hv = true;
+      else if (a == "--probe-transport") probe_transport = true;
       else if (a == "--pause") pause_at_end = true;   // the installer runs doctor in a console that closes
       else {
         std::fprintf(stderr, "doctor: unknown option %.*s\n", static_cast<int>(a.size()), a.data());
@@ -274,6 +363,27 @@ int main(int argc, char** argv) {
       } else {
         std::printf("[fail] TCP port %d is in use (a previous agent still running?)\n", want_port);
         ++problems;
+      }
+    }
+
+    // How long is a round-trip from inside the distro back to Windows over
+    // loopback? That one number decides whether Direction B needs the Hyper-V
+    // socket transport, and it cannot be inferred from the installed WSL
+    // version: a running WSL2 VM keeps the kernel it booted with, so a machine
+    // can carry the improvement for months without it taking effect.
+    //
+    // Measured with bash's /dev/tcp rather than our own binaries, so it works
+    // before anything has been staged into the distro. The distro end is a
+    // plain echo (`cat <&3 >&3`); all the timing happens here.
+    if (probe_transport) {
+      if (const auto rtt = probe_loopback_rtt(want_distro)) {
+        std::printf("[ok]   loopback round-trip from the distro: %.3f ms\n", *rtt);
+        if (*rtt < kFastLoopbackMs)
+          std::printf("       fast enough for Direction B over plain TCP; hvsocket is not required here\n");
+        else
+          std::printf("       slow: Direction B needs the Hyper-V socket transport on this machine\n");
+      } else {
+        std::printf("[warn] transport probe: could not measure (no bash /dev/tcp in the distro?)\n");
       }
     }
 

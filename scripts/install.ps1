@@ -375,8 +375,39 @@ function Get-TaskName($m) {
 # ===========================================================================
 Step 'Configuration'
 
-$useHv = -not $NoHvsocket
 $distro = if ($Distro) { $Distro } else { Get-DefaultDistro }
+
+# Direction B transport: measure, do not guess.
+#
+# hvsocket exists because the WSL localhost relay used to cost seconds per
+# round-trip. On current WSL it costs a fraction of a millisecond, and where
+# that holds, plain TCP is the better choice - it needs no HKLM registration,
+# no `wsl --shutdown`, and no elevated logon task, so the write-capable Windows
+# agent stops running as Administrator.
+#
+# This cannot be decided from the installed WSL version. A running WSL2 VM
+# keeps the kernel it booted with, so two machines on identical WSL versions
+# behave differently depending on whether the VM has restarted since its
+# kernel updated. So probe the thing that actually varies.
+if ($PSBoundParameters.ContainsKey('NoHvsocket')) {
+  $useHv = -not $NoHvsocket        # explicit wins, always
+} else {
+  # $srcCli is the built wsldrive.exe this install will copy; probe with it.
+  $probe = $srcCli
+  if (Test-Path $probe) {
+    $rtt = & $probe probe-transport --distro $distro 2>$null
+    $fast = ($LASTEXITCODE -eq 0)
+    if ($LASTEXITCODE -eq 2 -or -not $rtt) {
+      $useHv = $true
+      Warn "Could not measure the loopback round-trip; using hvsocket for Direction B."
+    } else {
+      $useHv = -not $fast
+      Say "       loopback round-trip $rtt ms -> Direction B over $(if($useHv){'hvsocket'}else{'TCP'})"
+    }
+  } else {
+    $useHv = $true                 # cannot probe without the binary; keep the safe default
+  }
+}
 
 # Every mount is one entry here, so several drives / distros coexist: each gets
 # its own port and its own logon task.
