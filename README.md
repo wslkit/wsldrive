@@ -50,8 +50,9 @@ your distro). The only thing you supply is what to mount where.
   No elevation for the mount, no registry changes, no WSL restart; the drive is visible to your normal
   apps and comes back on every reboot. This is the common case and the biggest WSL2 pain.
 - **Advanced — Direction A *and* B, side by side.** Adds a Windows folder mounted *inside* WSL
-  (a Linux path, not a drive letter). Direction B uses the Hyper-V socket transport, which needs a
-  one-time elevated registration and a single `wsl --shutdown` — the installer does both.
+  (a Linux path, not a drive letter). The installer **measures** the loopback round-trip to your
+  distro and picks Direction B's transport from that (see [Transports](#transports)); on current WSL
+  that means plain TCP, with no registry changes and no `wsl --shutdown`.
 
 ### 1. Download the installer (easiest — no build)
 
@@ -142,12 +143,35 @@ file's writes and flushes on `fsync`/close for write-heavy work.
 The wire protocol is a small framed binary protocol (24-byte little-endian header + payload) over a
 stream socket. Two transports:
 
-- **Hyper-V sockets** (`AF_HYPERV` on Windows, `AF_VSOCK` in WSL) — the fast path. WSL2 routes hvsocket
+- **Hyper-V sockets** (`AF_HYPERV` on Windows, `AF_VSOCK` in WSL). WSL2 routes hvsocket
   host→guest, so the **WSL side listens** (`vsock://any:<port>`) and the **Windows side connects**
-  (`hv://{<wsl-vm-guid>}:<port>`). Not IP, so no firewall involvement. This is what makes the
-  WSL→Windows direction fast; see [Enabling hvsocket](#enabling-the-hyper-v-socket-transport).
-- **Loopback TCP** — the fallback (works in NAT and mirrored WSL networking). Fast for Windows→WSL
-  (Direction A); slow for the WSL→Windows request path, which is why Direction B wants hvsocket.
+  (`hv://{<wsl-vm-guid>}:<port>`). Not IP, so no firewall involvement. Needed for Direction B only on
+  machines where the loopback relay is slow; see [Enabling hvsocket](#enabling-the-hyper-v-socket-transport).
+- **Loopback TCP** — works in NAT and mirrored WSL networking, and needs no setup at all. Always
+  used for Windows→WSL (Direction A). Whether it is fast enough for WSL→Windows (Direction B)
+  depends on the machine, so wsldrive measures rather than assumes.
+
+#### Which one you get, and why it is measured
+
+hvsocket exists because the WSL localhost relay used to cost **seconds** per round-trip, which made
+Direction B unusable over TCP. On current WSL it costs a fraction of a millisecond, and where that
+holds plain TCP is the better choice: no `HKLM` registration, no `wsl --shutdown` during install, no
+Hyper-V admin at run time — and so no elevated logon task, which means the write-capable Windows
+agent no longer runs as Administrator.
+
+This **cannot be decided from your WSL version**. A running WSL2 VM keeps the kernel it booted with,
+so a machine whose WSL updated months ago can still be on the old kernel until the VM next restarts —
+and two machines reporting the same `wsl --version` can behave differently. So the installer probes:
+
+```powershell
+wsldrive probe-transport --distro Ubuntu   # prints the median round-trip in ms
+                                           # exit 0 = TCP is fine, 1 = use hvsocket, 2 = could not measure
+wsldrive doctor --probe-transport          # the same measurement, in doctor's report
+```
+
+Under ~5 ms the installer picks TCP; above it, hvsocket (and then does the registration and the WSL
+restart). Pass `-NoHvsocket` to force TCP, or `-Advanced` with hvsocket left on to force that; an
+explicit flag always wins over the probe.
 
 ### Semantics (ext4 ↔ Windows)
 

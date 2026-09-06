@@ -375,8 +375,49 @@ function Get-TaskName($m) {
 # ===========================================================================
 Step 'Configuration'
 
-$useHv = -not $NoHvsocket
 $distro = if ($Distro) { $Distro } else { Get-DefaultDistro }
+
+# Direction B transport: measure, do not guess.
+#
+# hvsocket exists because the WSL localhost relay used to cost seconds per
+# round-trip. On current WSL it costs a fraction of a millisecond, and where
+# that holds, plain TCP is the better choice - it needs no HKLM registration,
+# no `wsl --shutdown`, and no elevated logon task, so the write-capable Windows
+# agent stops running as Administrator.
+#
+# This cannot be decided from the installed WSL version. A running WSL2 VM
+# keeps the kernel it booted with, so two machines on identical WSL versions
+# behave differently depending on whether the VM has restarted since its
+# kernel updated. So probe the thing that actually varies.
+if ($PSBoundParameters.ContainsKey('NoHvsocket')) {
+  $useHv = -not $NoHvsocket        # explicit wins, always
+} else {
+  # Probe with the wsldrive.exe this install will copy. Everything here is
+  # best-effort: a missing binary, a placeholder standing in for one (as in CI),
+  # a distro that will not start - none of that should stop an install, so any
+  # failure falls back to hvsocket rather than assuming TCP is fine.
+  $rtt = $null
+  $probeOk = $false
+  if ($srcCli -and (Test-Path $srcCli)) {
+    try {
+      $out = & $srcCli probe-transport --distro $distro 2>&1
+      if ($LASTEXITCODE -le 1) {
+        $val = 0.0
+        $last = ($out | Select-Object -Last 1)
+        if ([double]::TryParse([string]$last, [ref]$val)) { $rtt = $val; $probeOk = $true }
+      }
+    } catch {
+      $probeOk = $false                # not runnable here; fall through
+    }
+  }
+  if ($probeOk) {
+    $useHv = ($rtt -ge 5.0)
+    Say "       loopback round-trip $rtt ms -> Direction B over $(if($useHv){'hvsocket'}else{'TCP'})"
+  } else {
+    $useHv = $true
+    Say "       could not measure the loopback round-trip -> Direction B over hvsocket"
+  }
+}
 
 # Every mount is one entry here, so several drives / distros coexist: each gets
 # its own port and its own logon task.
