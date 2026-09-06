@@ -392,20 +392,30 @@ $distro = if ($Distro) { $Distro } else { Get-DefaultDistro }
 if ($PSBoundParameters.ContainsKey('NoHvsocket')) {
   $useHv = -not $NoHvsocket        # explicit wins, always
 } else {
-  # $srcCli is the built wsldrive.exe this install will copy; probe with it.
-  $probe = $srcCli
-  if (Test-Path $probe) {
-    $rtt = & $probe probe-transport --distro $distro 2>$null
-    $fast = ($LASTEXITCODE -eq 0)
-    if ($LASTEXITCODE -eq 2 -or -not $rtt) {
-      $useHv = $true
-      Warn "Could not measure the loopback round-trip; using hvsocket for Direction B."
-    } else {
-      $useHv = -not $fast
-      Say "       loopback round-trip $rtt ms -> Direction B over $(if($useHv){'hvsocket'}else{'TCP'})"
+  # Probe with the wsldrive.exe this install will copy. Everything here is
+  # best-effort: a missing binary, a placeholder standing in for one (as in CI),
+  # a distro that will not start - none of that should stop an install, so any
+  # failure falls back to hvsocket rather than assuming TCP is fine.
+  $rtt = $null
+  $probeOk = $false
+  if ($srcCli -and (Test-Path $srcCli)) {
+    try {
+      $out = & $srcCli probe-transport --distro $distro 2>&1
+      if ($LASTEXITCODE -le 1) {
+        $val = 0.0
+        $last = ($out | Select-Object -Last 1)
+        if ([double]::TryParse([string]$last, [ref]$val)) { $rtt = $val; $probeOk = $true }
+      }
+    } catch {
+      $probeOk = $false                # not runnable here; fall through
     }
+  }
+  if ($probeOk) {
+    $useHv = ($rtt -ge 5.0)
+    Say "       loopback round-trip $rtt ms -> Direction B over $(if($useHv){'hvsocket'}else{'TCP'})"
   } else {
-    $useHv = $true                 # cannot probe without the binary; keep the safe default
+    $useHv = $true
+    Say "       could not measure the loopback round-trip -> Direction B over hvsocket"
   }
 }
 
