@@ -643,8 +643,8 @@ if ($needShutdown) {
 # --- scheduled tasks (auto-start at logon) ---
 # Direction A maps a drive letter, which must be visible to the user's normal
 # (non-elevated) apps, so its task runs at the user's normal level (Limited).
-# Direction B mounts inside WSL and needs Hyper-V admin for VM-GUID discovery, so
-# its task runs Highest — elevation there does not affect any drive letter.
+# Direction B runs Highest only when it uses hvsocket, which needs Hyper-V admin
+# for VM-GUID discovery; over TCP it runs Limited like Direction A.
 function Register-MountTask([string]$name, [string]$exe, [string]$argline, [bool]$Elevated) {
   # Run through the windowless launcher so no console window appears at logon.
   # (The mount process runs for the life of the mount; a visible console could be
@@ -702,7 +702,15 @@ foreach ($m in $mounts) {
     $mpSh = ConvertTo-ShPath $m.Mountpoint
     $bcmd = "~/.local/bin/wsldrive mount $mpSh --win-root $(ConvertTo-ShQuoted $winRootFwd) --win-agent $(ConvertTo-ShQuoted $agentWslPath) --port $($m.Port)$hvArgB"
     $arg  = "-d $(ConvertTo-WinArg $m.Distro) -- bash -lc `"mkdir -p $mpSh; $bcmd`""
-    Register-MountTask $m.TaskName 'wsl.exe' $arg $true
+    # Elevated ONLY when this mount actually uses hvsocket. The elevation buys
+    # exactly one thing - Hyper-V admin for the hcsdiag VM-GUID lookup - and it
+    # is not free: interop processes started from an elevated wsl.exe are
+    # themselves elevated, so the write-capable Windows agent ends up applying
+    # write-through mutations under -WinRoot with administrator rights, and
+    # anything in the distro holding the token inherits that reach. Over plain
+    # TCP there is no GUID to look up, so the task runs Limited and the agent
+    # does not.
+    Register-MountTask $m.TaskName 'wsl.exe' $arg $m.UseHv
     Ok "$($m.Distro):$($m.Mountpoint) <= $($m.WinRoot) at logon ($(if($m.UseHv){'hvsocket'}else{'TCP'}) :$($m.Port))."
   }
 }
