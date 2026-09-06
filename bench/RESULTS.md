@@ -265,6 +265,30 @@ That is one machine and one WSL version, so the hvsocket path stays and stays
 recommended; but the claim that Direction B *requires* it no longer holds here,
 and it is worth re-checking before treating hvsocket setup as mandatory.
 
+#### It was not a recent update, and that matters
+
+The obvious reading — "a WSL update fixed it" — is wrong, and the real story is
+more useful. Nobody updated anything here:
+
+| | |
+|---|---|
+| kernel 6.18.33.1 built | 5 Jun 2026 |
+| WSL package 2.7.8.0 staged on this machine | 26 Jun 2026 |
+| slow-relay numbers above recorded, on **kernel 6.6** | 27-29 Aug 2026 |
+| WSL VM restarted (now running 6.18) | 1 Sep 2026 |
+| TCP round-trip measured at 0.224 ms | 5 Sep 2026 |
+
+A running WSL2 VM keeps the kernel it booted with; updating the package on disk
+does not restart it. So the newer kernel sat installed and unused for two months
+while the VM carried on with 6.6, and the improvement only appeared when the VM
+next restarted.
+
+The practical consequence: **you cannot tell which behaviour you will get from
+the installed WSL version alone.** It depends on whether the VM has restarted
+since the update. That is a strong argument for probing the transport at run
+time rather than gating on a version number, and it means other machines may be
+sitting on the same latent improvement without knowing.
+
 ### The mutual handshake costs nothing measurable
 
 The handshake gained a third leg when both ends started authenticating each
