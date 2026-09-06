@@ -41,6 +41,10 @@ class FuseMount {
  private:
   // Drains `inval_queue_`, dropping the kernel's cached pages for each path.
   void inval_loop();
+  /// Queues one absolute FUSE path for a cache punch. Used both by the agent's
+  /// invalidation hook and by the operation handlers, for mutations the mount
+  /// performed itself.
+  void enqueue_punch(std::string fuse_path);
 
   agent::RemoteRoot& root_;
   void* fuse_ = nullptr;  // struct fuse*

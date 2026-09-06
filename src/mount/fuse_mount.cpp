@@ -40,6 +40,7 @@ using TimespecT = struct timespec;
 #include <cstring>
 #include <deque>
 #include <mutex>
+#include <functional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -52,6 +53,9 @@ namespace {
 struct Context {
   agent::RemoteRoot* root;
   bool writeback = false;
+  // Queues an absolute FUSE path for a kernel cache punch. Set by FuseMount so
+  // the operation handlers can invalidate what their own mutations changed.
+  std::function<void(std::string)> punch;
 };
 
 Context* ctx() { return static_cast<Context*>(fuse_get_context()->private_data); }
@@ -72,6 +76,28 @@ WriteHandle* handle_of(struct fuse_file_info* fi) {
 
 // Flushes a write handle's buffer to the agent. Returns 0 or a negative errno.
 int flush_handle(WriteHandle* h);
+
+// Parent of an absolute FUSE path, as an absolute FUSE path ("/a/b" -> "/a",
+// "/a" -> "/").
+std::string fuse_parent(std::string_view p) {
+  const auto slash = p.find_last_of('/');
+  if (slash == std::string_view::npos || slash == 0) return "/";
+  return std::string(p.substr(0, slash));
+}
+
+// Drops the kernel's cached view of the directories a mutation just changed.
+//
+// The punch thread is fed by the agent's pushed invalidations, which cover
+// changes made on the far side. A mutation performed *through the mount* never
+// went near it: the mirror is updated synchronously and nothing tells the
+// kernel that the parent directory's contents moved. WinFsp will happily keep
+// serving that directory's cached listing for entry_timeout, so a rename
+// immediately followed by a lookup of the new name resolves through a listing
+// that predates it and reports the name missing - which is #88.
+void punch_parent(const char* path) {
+  if (path == nullptr || ctx()->punch == nullptr) return;
+  ctx()->punch(fuse_parent(path));
+}
 
 // Largest number of paths waiting for a kernel page-cache punch. Past this the
 // mount stops queueing: `auto_cache` still revalidates each file on its next
@@ -223,6 +249,7 @@ int op_create(const char* path, ModeT mode, struct fuse_file_info* fi) {
   if (!r) return err_to_errno(r.error());
   if (ctx()->writeback && fi != nullptr)
     fi->fh = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(new WriteHandle{rel, 0, {}}));
+  punch_parent(path);
   return 0;
 }
 
@@ -274,22 +301,37 @@ int op_truncate(const char* path, OffT size, struct fuse_file_info*) {
 
 int op_mkdir(const char* path, ModeT mode) {
   auto r = ctx()->root->mkdir(to_rel(path), static_cast<std::uint32_t>(mode) & 0777u);
-  return r ? 0 : err_to_errno(r.error());
+  if (!r) return err_to_errno(r.error());
+  punch_parent(path);
+  return 0;
 }
 
 int op_unlink(const char* path) {
   auto r = ctx()->root->unlink(to_rel(path));
-  return r ? 0 : err_to_errno(r.error());
+  if (!r) return err_to_errno(r.error());
+  punch_parent(path);
+  return 0;
 }
 
 int op_rmdir(const char* path) {
   auto r = ctx()->root->rmdir(to_rel(path));
-  return r ? 0 : err_to_errno(r.error());
+  if (!r) return err_to_errno(r.error());
+  punch_parent(path);
+  return 0;
 }
 
 int op_rename(const char* from, const char* to, unsigned int) {
   auto r = ctx()->root->rename(to_rel(from), to_rel(to));
-  return r ? 0 : err_to_errno(r.error());
+  if (!r) return err_to_errno(r.error());
+  // Both parents change, and the two names themselves do too - the source is
+  // gone and the destination is new.
+  punch_parent(from);
+  punch_parent(to);
+  if (ctx()->punch != nullptr) {
+    ctx()->punch(from);
+    ctx()->punch(to);
+  }
+  return 0;
 }
 
 int op_read(const char* path, char* buf, size_t size, OffT offset, struct fuse_file_info* fi) {
@@ -461,6 +503,9 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
 
   static Context context;  // FUSE keeps a single mount per process here
   context.root = &root_;
+  // Lets the operation handlers punch what their own mutations changed; the
+  // agent's pushed invalidations only cover changes made on the far side.
+  context.punch = [this](std::string p) { enqueue_punch(std::move(p)); };
   // Every handler below resolves case-insensitively (a Windows volume has to,
   // and Direction B keeps the same behaviour so both mounts agree). The client
   // has to resolve the same way, or a read of `readme.md` against a stored
@@ -537,6 +582,15 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
     mounted_.store(false);
   });
   return {};
+}
+
+void FuseMount::enqueue_punch(std::string fuse_path) {
+  {
+    std::lock_guard lock(inval_mu_);
+    if (inval_stop_ || inval_queue_.size() >= kInvalQueueCap) return;
+    inval_queue_.push_back(std::move(fuse_path));
+  }
+  inval_cv_.notify_one();
 }
 
 void FuseMount::inval_loop() {
