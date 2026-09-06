@@ -59,8 +59,18 @@ par8()    { find "$MP" -type f -print0 | xargs -0 -P 8 -n 40 cat; }
 # Cold = the first pass with nothing warm. Prefetch-on-mount is default-on, so
 # let it settle first; otherwise the number races the background prefetcher.
 sleep 2
-echo "cold_read_ms=$(ms readall)"
-echo "cold_walk_ms=$(ms walk)"
+# COLD_PARALLEL=1 measures eight readers against a cache that is still empty, so
+# every read has to cross to the agent. That is the one case where a
+# multi-threaded FUSE loop could plausibly win, and the warm numbers below
+# cannot see it: once the page cache is serving, the daemon is barely involved.
+if [ "${COLD_PARALLEL:-0}" = 1 ]; then
+  echo "cold_par8_read_ms=$(ms par8)"
+  echo "cold_read_ms=$(ms readall)"
+  echo "cold_walk_ms=$(ms walk)"
+else
+  echo "cold_read_ms=$(ms readall)"
+  echo "cold_walk_ms=$(ms walk)"
+fi
 
 med() {  # median of RUNS timings, one discarded warm-up first
   local fn="$1" i
