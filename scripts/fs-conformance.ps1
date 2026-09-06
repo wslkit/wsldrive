@@ -134,13 +134,29 @@ function Dump([string]$rel) {
 # -Dump names mount-relative paths to list from both sides when the check fails.
 # Give it the parent of whatever the check touched, plus the path itself when it
 # is a directory whose contents are the point.
-function Check([string]$name, [scriptblock]$body, [string[]]$Dump = @()) {
+# -Settle is a condition (not the whole body, which would re-run the mutation)
+# polled after a failure. It answers the question a dump cannot: was the mount
+# transiently wrong and then right, or is it wrong and staying wrong? A settle
+# time close to a cache timeout points at a stale cache; "still wrong" points at
+# lost state. #88 has been chased three times without that distinction.
+function Check([string]$name, [scriptblock]$body, [string[]]$Dump = @(), [scriptblock]$Settle = $null) {
   try {
     $r = & $body
     if ($r -is [bool] -and -not $r) { throw 'condition was false' }
     $script:pass++; Write-Host "  ok    $name"
   } catch {
     $script:fail++; Write-Host "  FAIL  $name -- $($_.Exception.Message)"
+    if ($Settle) {
+      $sw = [Diagnostics.Stopwatch]::StartNew()
+      $settled = $false
+      while ($sw.ElapsedMilliseconds -lt 5000) {
+        try { if (& $Settle) { $settled = $true; break } } catch {}
+        Start-Sleep -Milliseconds 10
+      }
+      $sw.Stop()
+      if ($settled) { Write-Host "        settled after $($sw.ElapsedMilliseconds) ms - transient, the mount caught up" }
+      else          { Write-Host "        still wrong after 5000 ms - not a timing window" }
+    }
     foreach ($p in $Dump) { Dump $p }
   }
 }
@@ -159,8 +175,8 @@ Check 'stat reports size'      { (Get-Item "$M\a.txt").Length -eq 11 }
 Check 'truncate'               { $fs = [IO.File]::Open("$M\a.txt", 'Open', 'ReadWrite'); try { $fs.SetLength(3) } finally { $fs.Dispose() }; (Raw "$M\a.txt") -eq 'hel' }
 Check 'mkdir (nested)'         { New-Item -ItemType Directory -Path "$M\d\sub\deeper" | Out-Null; Test-Path "$M\d\sub\deeper" -PathType Container }
 Check 'readdir sees entries'   { (Get-ChildItem "$M\" -Name) -contains 'a.txt' -and (Get-ChildItem "$M\d\sub" -Name) -contains 'deeper' }
-Check 'rename file'            { Move-Item "$M\a.txt" "$M\d\b.txt"; (Test-Path "$M\d\b.txt") -and -not (Test-Path "$M\a.txt") } -Dump '', 'd'
-Check 'rename directory keeps contents' { Rename-Item "$M\d\sub" 'sub2'; Test-Path "$M\d\sub2\deeper" } -Dump 'd', 'd\sub2', 'd\sub'
+Check 'rename file'            { Move-Item "$M\a.txt" "$M\d\b.txt"; (Test-Path "$M\d\b.txt") -and -not (Test-Path "$M\a.txt") } -Dump '', 'd' -Settle { (Test-Path "$M\d\b.txt") -and -not (Test-Path "$M\a.txt") }
+Check 'rename directory keeps contents' { Rename-Item "$M\d\sub" 'sub2'; Test-Path "$M\d\sub2\deeper" } -Dump 'd', 'd\sub2', 'd\sub' -Settle { Test-Path "$M\d\sub2\deeper" }
 Check 'delete file'            { Copy-Item "$M\d\b.txt" "$M\gone.txt"; Remove-Item "$M\gone.txt"; -not (Test-Path "$M\gone.txt") } -Dump ''
 Check 'rmdir'                  { Remove-Item "$M\d\sub2\deeper"; -not (Test-Path "$M\d\sub2\deeper") } -Dump 'd\sub2'
 Check 'missing file is an error' { try { Raw "$M\nope.txt"; $false } catch [IO.FileNotFoundException] { $true } }
