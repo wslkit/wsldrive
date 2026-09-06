@@ -91,7 +91,10 @@ std::wstring widen(std::string_view s) { return wsld::platform::win::to_wide(s);
 std::optional<double> probe_loopback_rtt(const std::string& distro) {
   auto listener = wsld::net::Listener::bind(*wsld::net::Endpoint::parse("tcp://127.0.0.1:0"));
   if (!listener) return std::nullopt;
-  const std::uint16_t port = listener->local().port;
+  // Endpoint::port is a uint32_t; keep it that way rather than narrowing to
+  // uint16_t just to format it (MSVC 14.51 treats that conversion as an error
+  // under /W4 /WX, and there is no reason to convert at all).
+  const std::uint32_t port = listener->local().port;
   const std::wstring d = distro.empty() ? L"" : L" -d " + widen(distro);
   HANDLE echo = spawn_quiet(L"wsl.exe" + d + L" -e bash -lc \"exec 3<>/dev/tcp/127.0.0.1/" +
                             std::to_wstring(port) + L"; cat <&3 >&3\"");
