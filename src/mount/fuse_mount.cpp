@@ -524,15 +524,30 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
   });
 
   loop_ = std::thread([this] {
-    // Deliberately single-threaded. fuse_loop_mt() was measured against this
-    // (3000 files, agent and mount both in WSL over loopback, so only the
-    // serving path is timed) and lost in every configuration: a warm read pass
-    // went 210 -> 289 ms and eight parallel readers 78 -> 117 ms. With the page
-    // cache doing the repeat reads the daemon is barely on the path, and the
-    // requests that do reach it spend their time under RemoteRoot's single
-    // cache mutex, which more threads only contend for. Revisit only after that
-    // contention is addressed, and re-measure parallel cold reads across a real
-    // boundary - the one case this comparison could not see.
+    // Deliberately single-threaded. fuse_loop_mt() has been measured against
+    // this repeatedly (3000 files, agent and mount both in WSL over loopback,
+    // so only the serving path is timed) and loses every time:
+    //
+    //                              single-threaded   fuse_loop_mt
+    //   warm read                      210 ms           289 ms
+    //   warm read, 8 in parallel        78 ms           117 ms
+    //   COLD read, 8 in parallel       155 ms           222 ms
+    //   COLD read, sequential          298 ms           380 ms
+    //
+    // The cold parallel row is the one that settles it. An earlier version of
+    // this comment reserved judgement there, on the grounds that threads should
+    // help when requests genuinely block on the far side rather than being
+    // served from cache. They do not: the client below already pipelines its
+    // boundary crossings (one bulk ReadMany per directory, plus the async
+    // prefetcher), so the FUSE hop is not what limits concurrency, and adding
+    // threads there buys dispatch overhead and lock contention with nothing to
+    // overlap.
+    //
+    // Still untested, and the only reason to revisit: the same comparison
+    // across the real VM boundary, where per-request latency is higher than
+    // loopback. Higher latency favours overlapping, so it is the case most
+    // likely to change the answer - though the client's batching means few
+    // requests are ever in flight at the FUSE hop regardless.
     fuse_loop(static_cast<struct fuse*>(fuse_));
     mounted_.store(false);
   });

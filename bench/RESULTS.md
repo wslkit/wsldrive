@@ -304,3 +304,32 @@ alternating:
 One extra loopback round-trip and a BLAKE3 hash against ~15 ms of process start
 and snapshot transfer. A first pass over only 15 samples suggested 16 → 37 ms;
 that was noise (min 15, max 134) and did not survive more samples.
+
+## fuse_loop_mt, settled (2026-09-06)
+
+The earlier comparison left one case open: parallel **cold** reads, where
+requests genuinely reach the daemon and block, rather than being served from the
+page cache. That was the scenario a multi-threaded FUSE loop should win, and it
+was the stated reason to keep the question open.
+
+Measured with `COLD_PARALLEL=1 scripts/bench/fuse-floor.sh` (3000 files, agent
+and mount both in WSL over loopback, medians of two runs each):
+
+| | single-threaded | `fuse_loop_mt` |
+|---|--:|--:|
+| warm read | 210 ms | 289 ms |
+| warm read, 8 in parallel | 78 ms | 117 ms |
+| **cold read, 8 in parallel** | **155 ms** | **222 ms** |
+| cold read, sequential | 298 ms | 380 ms |
+
+It loses there too, by about 43%. So the premise does not hold: the FUSE hop is
+not what limits concurrency. The client below it already pipelines its boundary
+crossings — one bulk `ReadMany` per directory, plus the async prefetcher — so
+few requests are ever in flight at that hop, and adding threads buys dispatch
+overhead and lock contention with nothing to overlap.
+
+One case remains unmeasured, and it is the only reason to revisit: the same
+comparison across the real VM boundary, where per-request latency is higher than
+loopback. Higher latency favours overlapping. Against that, the client's
+batching means the number of concurrent requests at the FUSE hop stays low
+regardless, so it would be surprising to see the answer flip.
