@@ -4,7 +4,7 @@
 
 # wsldrive
 
-[![CI](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml/badge.svg)](https://github.com/zcsizmadia/wsldrive/actions/workflows/ci.yml)
+[![CI](https://github.com/wslkit/wsldrive/actions/workflows/ci.yml/badge.svg)](https://github.com/wslkit/wsldrive/actions/workflows/ci.yml)
 
 **Cross the WSL2 filesystem boundary at native speed — in both directions.**
 
@@ -56,7 +56,7 @@ your distro). The only thing you supply is what to mount where.
 
 ### 1. Download the installer (easiest — no build)
 
-Grab **`wsldrive-setup.exe`** from the [latest release](https://github.com/zcsizmadia/wsldrive/releases/latest)
+Grab **`wsldrive-setup.exe`** from the [latest release](https://github.com/wslkit/wsldrive/releases/latest)
 and run it. The wizard sets up Direction A by default; tick **Advanced** to also add Direction B.
 
 Each release also ships `wsldrive-windows-x64.zip` (everything the script route needs: the Windows and
@@ -66,7 +66,7 @@ SmartScreen will warn on first run).
 
 ### 2. Run the script (no packaging — for CI, locked-down machines, or preference)
 
-Download `wsldrive-windows-x64.zip` from the [latest release](https://github.com/zcsizmadia/wsldrive/releases/latest)
+Download `wsldrive-windows-x64.zip` from the [latest release](https://github.com/wslkit/wsldrive/releases/latest)
 (or clone the repo), then from an **elevated** PowerShell:
 
 ```powershell
