@@ -175,9 +175,24 @@ int caller_pid() {
   return c != nullptr ? static_cast<int>(c->pid) : 0;
 }
 
-bool claim_poke(FsNotifyBridge::Poke what, std::string_view rel, std::string_view rel2 = {}) {
+enum class PokeVerdict {
+  NotOurs,  // an ordinary request; forward it across the boundary
+  Claimed,  // the poke we are waiting for; answer it here and raise the event
+  Refuse,   // from the bridge's thread but not the poke we expected; see below
+};
+
+// A mutation request from the bridge's own thread is never forwarded, even when
+// it is not the poke that was expected. The bridge issues no genuine mutations,
+// so forwarding one could only re-apply a change the far side already made —
+// and for a creation that means replacing the file whose arrival prompted the
+// notification with an empty one. A refused poke costs a missed event; a
+// forwarded one costs data.
+PokeVerdict claim_poke(FsNotifyBridge::Poke what, std::string_view rel, std::string_view rel2 = {}) {
   FsNotifyBridge* b = ctx()->notify;
-  return b != nullptr && b->claim(caller_pid(), what, rel, rel2);
+  if (b == nullptr) return PokeVerdict::NotOurs;
+  const int caller = caller_pid();
+  if (b->claim(caller, what, rel, rel2)) return PokeVerdict::Claimed;
+  return b->is_poke_thread(caller) ? PokeVerdict::Refuse : PokeVerdict::NotOurs;
 }
 
 // Fills `st` with a minimal stat for a path the mirror no longer has, so the
@@ -323,7 +338,11 @@ int op_truncate(const char* path, OffT size, struct fuse_file_info*) {
 // mknod instead of open(O_CREAT) now work on the mount.
 int op_mknod(const char* path, ModeT mode, DevT) {
   const std::string rel = to_rel(path);
-  if (claim_poke(FsNotifyBridge::Poke::Mknod, rel)) return 0;
+  switch (claim_poke(FsNotifyBridge::Poke::Mknod, rel)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
   if ((mode & S_IFMT) != 0 && (mode & S_IFMT) != S_IFREG) return -EPERM;  // no devices across the boundary
   auto r = ctx()->root->create_file(rel, static_cast<std::uint32_t>(mode) & 0777u);
   return r ? 0 : err_to_errno(r.error());
@@ -331,21 +350,33 @@ int op_mknod(const char* path, ModeT mode, DevT) {
 
 int op_mkdir(const char* path, ModeT mode) {
   const std::string rel = to_rel(path);
-  if (claim_poke(FsNotifyBridge::Poke::Mkdir, rel)) return 0;
+  switch (claim_poke(FsNotifyBridge::Poke::Mkdir, rel)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
   auto r = ctx()->root->mkdir(rel, static_cast<std::uint32_t>(mode) & 0777u);
   return r ? 0 : err_to_errno(r.error());
 }
 
 int op_unlink(const char* path) {
   const std::string rel = to_rel(path);
-  if (claim_poke(FsNotifyBridge::Poke::Unlink, rel)) return 0;
+  switch (claim_poke(FsNotifyBridge::Poke::Unlink, rel)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
   auto r = ctx()->root->unlink(rel);
   return r ? 0 : err_to_errno(r.error());
 }
 
 int op_rmdir(const char* path) {
   const std::string rel = to_rel(path);
-  if (claim_poke(FsNotifyBridge::Poke::Rmdir, rel)) return 0;
+  switch (claim_poke(FsNotifyBridge::Poke::Rmdir, rel)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
   auto r = ctx()->root->rmdir(rel);
   return r ? 0 : err_to_errno(r.error());
 }
@@ -353,7 +384,11 @@ int op_rmdir(const char* path) {
 int op_rename(const char* from, const char* to, unsigned int) {
   const std::string rfrom = to_rel(from);
   const std::string rto = to_rel(to);
-  if (claim_poke(FsNotifyBridge::Poke::Rename, rfrom, rto)) return 0;
+  switch (claim_poke(FsNotifyBridge::Poke::Rename, rfrom, rto)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
   auto r = ctx()->root->rename(rfrom, rto);
   return r ? 0 : err_to_errno(r.error());
 }

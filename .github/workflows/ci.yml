@@ -63,7 +63,11 @@ jobs:
       # the far side has to raise a real inotify event here, or every watch-mode
       # tool silently does nothing. Which kernel hook each operation runs is not
       # observable from a unit test, so it can only be checked on a live mount.
+      # always(): the two batteries cover different things, and when the
+      # filesystem one fails the change-notification verdict is exactly what
+      # says whether the two failures share a cause.
       - name: Run the change-notification battery
+        if: always()
         run: bash scripts/inotify-conformance.sh
 
   # The same idea for Direction A - the feature the product is named for. Mounts

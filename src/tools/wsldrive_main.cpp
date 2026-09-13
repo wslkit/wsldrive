@@ -676,12 +676,14 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long long>(st.rescans), static_cast<unsigned long long>(st.rescan_failures));
       }
     }
-    // Worth a line when notifications were lost: a watcher that missed one sees
-    // a change late, and this is the only place that would say so.
-    if (const auto ns = fm.notify_stats(); ns.dropped != 0 || ns.failed != 0)
-      std::fprintf(stderr, "wsldrive: %llu change notifications dropped, %llu could not be delivered (of %llu)\n",
-                   static_cast<unsigned long long>(ns.dropped), static_cast<unsigned long long>(ns.failed),
-                   static_cast<unsigned long long>(ns.events));
+    // Always reported, not only on loss. Change delivery is invisible when it
+    // works and equally invisible when it does not, so a count of what actually
+    // went out is the only way to tell the two apart after the fact.
+    if (const auto ns = fm.notify_stats(); ns.events != 0)
+      std::printf("change notifications: %llu delivered, %llu failed, %llu dropped, %llu rescans (of %llu)\n",
+                  static_cast<unsigned long long>(ns.delivered), static_cast<unsigned long long>(ns.failed),
+                  static_cast<unsigned long long>(ns.dropped), static_cast<unsigned long long>(ns.rescans),
+                  static_cast<unsigned long long>(ns.events));
     std::printf("unmounting...\n");
     std::fflush(stdout);
     fm.unmount();  // agent (if auto-launched) is stopped by its destructor on return

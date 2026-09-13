@@ -23,6 +23,18 @@ namespace wsld::mount {
 
 namespace {
 
+const char* change_name(ChangeKind c) noexcept {
+  switch (c) {
+    case ChangeKind::Created: return "creation of";
+    case ChangeKind::Modified: return "change to";
+    case ChangeKind::Removed: return "removal of";
+    case ChangeKind::MovedFrom: return "move away from";
+    case ChangeKind::MovedTo: return "move onto";
+    case ChangeKind::Unknown: break;
+  }
+  return "change to";
+}
+
 #ifdef __linux__
 long this_tid() noexcept { return static_cast<long>(::syscall(SYS_gettid)); }
 #endif
@@ -79,6 +91,8 @@ FsNotifyBridge::Pretend FsNotifyBridge::pretend(int caller, std::string_view rel
   kind = active_.kind;
   return active_.pretend_path;
 }
+
+bool FsNotifyBridge::is_poke_thread(int caller) const noexcept { return is_self(caller); }
 
 bool FsNotifyBridge::claim(int caller, Poke what, std::string_view rel, std::string_view rel2) {
   if (!is_self(caller)) return false;
@@ -196,8 +210,18 @@ void FsNotifyBridge::deliver(const Job& job) {
     }
   }
   std::lock_guard lock(stats_mu_);
-  if (ok) ++stats_.delivered;
-  else ++stats_.failed;
+  if (ok) {
+    ++stats_.delivered;
+    return;
+  }
+  ++stats_.failed;
+  // A failed poke is a missed notification, which is silent by nature — the
+  // mount stays correct, so nothing else would ever say it happened. Name the
+  // first few, then stop: a storm of them must not become the log.
+  if (stats_.failed <= kMaxReportedFailures)
+    std::fprintf(stderr, "wsldrive: could not notify watchers of %s '%s'%s\n", change_name(job.change),
+                 job.path.empty() ? "<root>" : job.path.c_str(),
+                 stats_.failed == kMaxReportedFailures ? " (further failures not reported)" : "");
 }
 
 #ifdef __linux__

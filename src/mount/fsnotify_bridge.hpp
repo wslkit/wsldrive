@@ -145,6 +145,18 @@ class FsNotifyBridge {
   /// retry or a duplicate request is forwarded like any other.
   [[nodiscard]] bool claim(int caller, Poke what, std::string_view rel, std::string_view rel2 = {});
 
+  /// Whether `caller` is the bridge's poke thread at all, matching poke or not.
+  ///
+  /// This is what makes an unrecognised poke safe. The bridge never performs a
+  /// genuine mutation, so a mutation request arriving from its thread is one of
+  /// its own replays and nothing else. If `claim()` did not recognise it — a
+  /// bug, a path spelled differently than expected, a syscall the kernel turned
+  /// into a different operation — the only safe answer is to refuse it. The
+  /// alternative is forwarding it, and forwarding a create means asking the
+  /// agent to replace the very file whose arrival prompted the notification
+  /// with an empty one.
+  [[nodiscard]] bool is_poke_thread(int caller) const noexcept;
+
  private:
   struct Job {
     ChangeKind change = ChangeKind::Unknown;
@@ -208,6 +220,9 @@ class FsNotifyBridge {
   // cache are already correct, so the file reads right the moment anything
   // looks at it. Sized for a burst the size of an `npm install`.
   static constexpr std::size_t kQueueCap = 65536;
+
+  // How many failed pokes are named individually before the log goes quiet.
+  static constexpr std::uint64_t kMaxReportedFailures = 8;
 };
 
 }  // namespace wsld::mount
