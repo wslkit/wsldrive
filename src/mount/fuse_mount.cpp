@@ -617,9 +617,30 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback, boo
   // kernel has dropped the pages, and doing that on RemoteRoot's reader thread
   // would stall every other reply behind it.
   //
-  // The 981ms-to-5ms figure is a libfuse measurement; WinFsp showed no
-  // difference from the page-cache change either way, so this costs nothing
-  // measurable there and is left on for both.
+  // Linux only, because on Windows there is nothing to punch with.
+  // WinFsp-FUSE's fuse_invalidate_path is a stub — inc/fuse3/fuse.h, unchanged
+  // from v2.0 through master:
+  //
+  //     FSP_FUSE_SYM(
+  //     int fuse3_invalidate_path(struct fuse3 *f, const char *path),
+  //     {
+  //         (void)f;
+  //         (void)path;
+  //         return -ENOENT;
+  //     })
+  //
+  // winfsp_fuse.h maps that spelling onto the standard one and FSP_FUSE_SYM
+  // expands to `static inline`, so the call never leaves the translation unit,
+  // never reaches the DLL, and invalidates nothing. An earlier version of this
+  // comment recorded that WinFsp "showed no difference from the page-cache
+  // change either way" and concluded it was free there. The measurement was
+  // right and the conclusion was wrong: it is free because it does nothing.
+  //
+  // So Direction A gets a thread and a queue that exist only to call a no-op a
+  // few thousand times per burst. Skip both, and stop implying a coherence
+  // mechanism is running there when none is. What WinFsp does offer is a mount
+  // option, -o FileInfoTimeout / -o DirInfoTimeout; see #88.
+#ifndef _WIN32
   {
     std::lock_guard lock(inval_mu_);
     inval_stop_ = false;
@@ -646,6 +667,7 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback, boo
     }
     notify_.post(changes);
   });
+#endif  // !_WIN32
 
   loop_ = std::thread([this] {
     // Deliberately single-threaded. fuse_loop_mt() has been measured against
