@@ -990,6 +990,142 @@ TEST_F(AgentTest, LiveInvalidationsReachTheClient) {
   EXPECT_GT(client->stats().generation, 1u);
 }
 
+// The change kind is what a notification consumer keys off, and it is decided
+// in three places: the watcher names the event, the agent re-stats the path and
+// may overrule it, and the client compares against its own mirror to settle
+// created-versus-modified. This drives events in directly (RootServer::notify)
+// rather than through a platform watcher, so it exercises the whole chain
+// wherever the suite runs.
+TEST_F(AgentTest, ChangeKindsReachTheClient) {
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto client = connect_client(srv.endpoint());
+  ASSERT_NE(client, nullptr);
+  ASSERT_TRUE(client->connect().has_value());
+  ASSERT_TRUE(client->fetch_snapshot().has_value());
+
+  std::mutex mu;
+  std::condition_variable cv;
+  std::vector<RemoteRoot::AppliedChange> seen;
+  client->set_invalidated_paths_hook([&](std::span<const RemoteRoot::AppliedChange> changes) {
+    std::lock_guard lock(mu);
+    seen.insert(seen.end(), changes.begin(), changes.end());
+    cv.notify_all();
+  });
+  auto wait_for = [&](auto pred) {
+    std::unique_lock lock(mu);
+    return cv.wait_for(lock, 10s, [&] { return pred(seen); });
+  };
+  auto change_of = [&](std::string_view path) {
+    std::lock_guard lock(mu);
+    for (const auto& c : seen)
+      if (c.path == path) return c.change;
+    return ChangeKind::Unknown;
+  };
+  auto forget = [&] {
+    std::lock_guard lock(mu);
+    seen.clear();
+  };
+  auto saw = [&](std::string_view path) {
+    return [path](const auto& v) {
+      for (const auto& c : v)
+        if (c.path == path) return true;
+      return false;
+    };
+  };
+
+  // A path the mirror does not have yet is a creation.
+  write_file(root_ / "src" / "fresh.cpp", "// fresh\n");
+  srv.server().notify(FsEvent{FsEventKind::Created, "src/fresh.cpp"});
+  ASSERT_TRUE(wait_for(saw("src/fresh.cpp")));
+  EXPECT_EQ(change_of("src/fresh.cpp"), ChangeKind::Created);
+
+  // The same path again, now that the mirror has it, is a modification — even
+  // though the agent reports exactly the same thing about it either time.
+  forget();
+  write_file(root_ / "src" / "fresh.cpp", "// fresher\n");
+  srv.server().notify(FsEvent{FsEventKind::Modified, "src/fresh.cpp"});
+  ASSERT_TRUE(wait_for(saw("src/fresh.cpp")));
+  EXPECT_EQ(change_of("src/fresh.cpp"), ChangeKind::Modified);
+
+  // A rename keeps both halves and the cookie that ties them together.
+  forget();
+  fs::rename(root_ / "src" / "fresh.cpp", root_ / "src" / "renamed.cpp");
+  srv.server().notify(FsEvent{FsEventKind::RenamedFrom, "src/fresh.cpp", 1234});
+  srv.server().notify(FsEvent{FsEventKind::RenamedTo, "src/renamed.cpp", 1234});
+  ASSERT_TRUE(wait_for([](const auto& v) {
+    bool from = false, to = false;
+    for (const auto& c : v) {
+      from |= c.change == ChangeKind::MovedFrom;
+      to |= c.change == ChangeKind::MovedTo;
+    }
+    return from && to;
+  }));
+  {
+    std::lock_guard lock(mu);
+    std::uint32_t from_cookie = 0, to_cookie = 0;
+    for (const auto& c : seen) {
+      if (c.change == ChangeKind::MovedFrom) {
+        EXPECT_EQ(c.path, "src/fresh.cpp");
+        from_cookie = c.cookie;
+      }
+      if (c.change == ChangeKind::MovedTo) {
+        EXPECT_EQ(c.path, "src/renamed.cpp");
+        to_cookie = c.cookie;
+      }
+    }
+    EXPECT_NE(from_cookie, 0u);
+    EXPECT_EQ(from_cookie, to_cookie);
+  }
+
+  // A deletion names what was removed, and says whether it was a directory —
+  // the mirror is the only side that still knows, since the path is gone from
+  // the disk by the time anything asks.
+  forget();
+  fs::remove_all(root_ / "Docs");
+  srv.server().notify(FsEvent{FsEventKind::Removed, "Docs"});
+  ASSERT_TRUE(wait_for(saw("Docs")));
+  EXPECT_EQ(change_of("Docs"), ChangeKind::Removed);
+  {
+    std::lock_guard lock(mu);
+    for (const auto& c : seen)
+      if (c.path == "Docs") EXPECT_EQ(c.kind, NodeKind::Directory);
+  }
+}
+
+// A removal for a path the mirror never had changed nothing, so reporting it
+// would tell a consumer a file it never saw had just been deleted.
+TEST_F(AgentTest, RemovalOfAnUnknownPathIsNotReported) {
+  LoopbackServer srv(root_, /*watch=*/false);
+  auto client = connect_client(srv.endpoint());
+  ASSERT_NE(client, nullptr);
+  ASSERT_TRUE(client->connect().has_value());
+  ASSERT_TRUE(client->fetch_snapshot().has_value());
+
+  std::mutex mu;
+  std::condition_variable cv;
+  std::vector<RemoteRoot::AppliedChange> seen;
+  int batches = 0;
+  client->set_invalidated_paths_hook([&](std::span<const RemoteRoot::AppliedChange> changes) {
+    std::lock_guard lock(mu);
+    seen.insert(seen.end(), changes.begin(), changes.end());
+    cv.notify_all();
+  });
+  client->set_invalidation_hook([&](const proto::InvalidationBatch&) {
+    std::lock_guard lock(mu);
+    ++batches;
+    cv.notify_all();
+  });
+
+  srv.server().notify(FsEvent{FsEventKind::Removed, "never-existed.txt"});
+  // Wait on the raw batch, which does arrive, then check that nothing was
+  // reported as applied: the two hooks differ exactly here.
+  {
+    std::unique_lock lock(mu);
+    ASSERT_TRUE(cv.wait_for(lock, 10s, [&] { return batches > 0; }));
+    EXPECT_TRUE(seen.empty());
+  }
+}
+
 TEST_F(AgentTest, RescanRefetchesTheSnapshot) {
   // When the agent's watcher overflows it sends a single Rescan instead of the
   // events it lost. Ignoring it left the mirror stale until remount — exactly in

@@ -123,6 +123,8 @@ void RootServer::flush_loop() {
       proto::InvalidationOp out;
       out.kind = op.kind;
       out.path = std::move(op.path);
+      out.change = op.change;
+      out.cookie = op.cookie;
       if (out.kind != InvalidationKind::Rescan) {
         // Both kinds are resolved against the disk NOW, not against the event.
         // A Remove that is not re-checked is a real hazard: git renames
@@ -133,11 +135,28 @@ void RootServer::flush_loop() {
         auto attr = read_attributes(join_relative(opts_.root, out.path));
         if (!attr) {
           out.kind = InvalidationKind::Remove;  // gone (or vanished between the event and now)
+          // The disk overrules the event for the change kind too. Gone means
+          // removed, unless the event already said this is the source half of a
+          // move — which is the one reading of "gone" that carries more
+          // information, so it survives with its cookie.
+          if (out.change != ChangeKind::MovedFrom) {
+            out.change = ChangeKind::Removed;
+            out.cookie = 0;
+          }
         } else if (attr->kind == NodeKind::Other) {
           continue;
         } else {
           out.kind = InvalidationKind::Upsert;  // present, whatever the event said
           out.attr = *attr;
+          // Present, so it is not gone and not the source of a move. Say only
+          // what is still true: something changed here. A peer that tracks
+          // change notifications decides between "created" and "modified" from
+          // whether its own mirror already had the path — it is the only side
+          // that knows, and it has to make that call regardless.
+          if (out.change == ChangeKind::Removed || out.change == ChangeKind::MovedFrom) {
+            out.change = ChangeKind::Modified;
+            out.cookie = 0;
+          }
         }
       }
       // A directory that has just appeared (mkdir, or - the case that matters -
@@ -149,6 +168,10 @@ void RootServer::flush_loop() {
       batch.ops.push_back(std::move(out));
     }
     if (!expand_dirs.empty()) append_subtrees(std::move(expand_dirs), batch.ops);
+    // Re-stating every path above can reclassify one half of a move (its source
+    // exists again, or its destination is already gone) and leave the other
+    // half pointing at a partner this batch no longer contains.
+    repair_move_pairs(batch.ops);
     if (!batch.ops.empty()) broadcast_batch(batch);
     lock.lock();
   }
@@ -178,7 +201,10 @@ void RootServer::append_subtrees(std::vector<std::string> dirs, std::vector<prot
         [&](const SnapshotEntry& e) {
           std::string p = rels[e.parent] + "/" + std::string(e.name);
           if (++appended > opts_.max_expanded_entries) over = true;
-          if (!over && !present.contains(p)) ops.push_back(proto::InvalidationOp{InvalidationKind::Upsert, p, e.attr});
+          // The whole subtree is arriving at once, so every entry in it is new
+          // to the peer even though no watcher event named it.
+          if (!over && !present.contains(p))
+            ops.push_back(proto::InvalidationOp{InvalidationKind::Upsert, p, e.attr, ChangeKind::Created, 0});
           rels.push_back(std::move(p));
         },
         // Once over budget, decline every subdirectory so the scan winds down

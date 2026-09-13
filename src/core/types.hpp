@@ -38,4 +38,30 @@ enum class InvalidationKind : std::uint8_t {
   Rescan = 2,  // the watcher lost events; refetch a snapshot of this subtree
 };
 
+/// What actually happened to a path, as opposed to what a mirror must do about
+/// it. InvalidationKind is all a metadata mirror needs: refresh the node, or
+/// drop it. A change-notification consumer needs more — it has to tell a file
+/// that appeared from one that was rewritten, and it has to see the two halves
+/// of a rename as one move rather than as an unrelated removal and creation.
+///
+/// The two travel together in every invalidation op. Nothing in the mirror
+/// depends on this field, so a consumer that ignores it stays correct.
+enum class ChangeKind : std::uint8_t {
+  Unknown = 0,    // no watcher event behind this op (a subtree expansion, a rescan)
+  Created = 1,
+  Modified = 2,
+  Removed = 3,
+  MovedFrom = 4,  // source half of a rename, paired with its MovedTo by cookie
+  MovedTo = 5,    // destination half
+};
+
+/// Highest valid ChangeKind value, for validating one off the wire. Derived, so
+/// adding a kind cannot leave it behind.
+inline constexpr std::uint8_t kMaxChangeKind = static_cast<std::uint8_t>(ChangeKind::MovedTo);
+
+/// True for the two halves of a rename, the only ops that carry a cookie.
+[[nodiscard]] constexpr bool is_move(ChangeKind c) noexcept {
+  return c == ChangeKind::MovedFrom || c == ChangeKind::MovedTo;
+}
+
 }  // namespace wsld

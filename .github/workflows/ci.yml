@@ -49,7 +49,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y ninja-build libfuse3-dev fuse3
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libfuse3-dev fuse3 inotify-tools
       - name: Build
         run: |
           cmake --preset linux-release
@@ -59,6 +59,12 @@ jobs:
           git config --global user.email ci@example.com
           git config --global user.name CI
           bash scripts/fs-conformance.sh
+      # The other half of "the mount behaves like a filesystem": a change made on
+      # the far side has to raise a real inotify event here, or every watch-mode
+      # tool silently does nothing. Which kernel hook each operation runs is not
+      # observable from a unit test, so it can only be checked on a live mount.
+      - name: Run the change-notification battery
+        run: bash scripts/inotify-conformance.sh
 
   # The same idea for Direction A - the feature the product is named for. Mounts
   # a real drive letter through WinFsp on the Windows runner and runs the Windows

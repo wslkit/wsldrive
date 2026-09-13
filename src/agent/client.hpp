@@ -52,12 +52,32 @@ class RemoteRoot {
     std::uint64_t rescan_failures = 0;
   };
 
+  /// One far-side change this client actually applied to its mirror, described
+  /// the way a change-notification consumer needs it rather than the way the
+  /// mirror needed it.
+  ///
+  /// The difference is what the mirror knows and the agent does not. The agent
+  /// reports that a path exists and has changed; only the mirror can say
+  /// whether it had that path a moment ago, which is what separates a file
+  /// being created from the same file being rewritten. `change` here is that
+  /// verdict, already made.
+  struct AppliedChange {
+    ChangeKind change = ChangeKind::Unknown;
+    std::string path;          // relative, '/'-separated
+    std::uint32_t cookie = 0;  // pairs the two halves of a move
+    NodeKind kind = NodeKind::File;  // what the path is — for a removal, what it was
+    // The whole mirror was replaced: the agent's watcher lost events, so no
+    // per-path change can be named. `path` is empty and every other field
+    // meaningless. Delivered after the replacement snapshot has landed.
+    bool rescan = false;
+  };
+
   using InvalidationHook = std::function<void(const proto::InvalidationBatch&)>;
-  /// Paths whose mirrored state a batch actually changed - the ops that were
-  /// applied, not the ones discarded as stale relative to this client's own
-  /// mutation. Separate from InvalidationHook, which reports the raw batch for
+  /// Changes a batch actually made to the mirror - the ops that were applied,
+  /// not the ones discarded as stale relative to this client's own mutation.
+  /// Separate from InvalidationHook, which reports the raw batch for
   /// diagnostics (`wsldrive watch`) and so has different callers.
-  using InvalidatedPathsHook = std::function<void(std::span<const std::string>)>;
+  using InvalidatedPathsHook = std::function<void(std::span<const AppliedChange>)>;
 
   explicit RemoteRoot(std::unique_ptr<net::FrameChannel> ch);
   ~RemoteRoot();

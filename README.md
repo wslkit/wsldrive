@@ -31,7 +31,8 @@ driver of its own (WinFsp on Windows, libfuse3 in WSL). Full numbers in [`bench/
   Desktop, Explorer/Search, Unity, Office) reach a WSL source tree without paying the `\\wsl.localhost`
   Plan 9 tax.
 - **Direction B — a Windows drive mounted inside WSL2.** Linux tools read/write an NTFS tree without the
-  `/mnt/c` 9P/virtiofs tax.
+  `/mnt/c` 9P/virtiofs tax — and a Windows-side edit fires `inotify`, so
+  [watch mode works](#watch-mode-works-inotify-across-the-boundary).
 
 WSL2 only. WSL1 has no VM boundary (DrvFs runs in the NT kernel, `\\wsl$` is served in-process), so it
 has neither problem and is unsupported by design.
@@ -120,7 +121,8 @@ Two small user-space binaries, no kernel drivers of wsldrive's own:
   it for changes (`ReadDirectoryChangesW`+IOCP on Windows, inotify on Linux), pushing coalesced
   invalidations.
 - **`wsldrive`** — the *client*: mounts the served tree as a filesystem (WinFsp on Windows, libfuse3 in
-  WSL, one FUSE3 implementation) backed by an in-RAM metadata mirror and a content cache.
+  WSL, one FUSE3 implementation) backed by an in-RAM metadata mirror and a content cache. In WSL it
+  also turns each invalidation into a real `inotify` event, so watch-mode tools see far-side changes.
 
 Either binary can host either role, so the same code serves both directions — the direction is just
 which side runs the agent and which runs the mount.
@@ -187,6 +189,25 @@ explicit flag always wins over the probe.
 
 A `.wsldriveignore` at the served root (gitignore-style: `node_modules/`, `*.log`, `/build`, …) excludes
 paths from the mount and from sync.
+
+### Watch mode works (`inotify` across the boundary)
+
+Edit a file from a Windows editor and `vite`, `nodemon`, `tsc --watch`, `jest --watch`, `air` and
+`cargo-watch` reload — on a Direction B mount, with no plugin, no preload and no polling.
+
+They do not, on `/mnt/c` or anywhere else. A change made by a Windows application raises no `inotify`
+event inside WSL2, so a Linux watcher never fires. Nothing errors; the tooling just quietly stops
+reacting, which is why people lose an afternoon to it before finding
+[microsoft/WSL#4739](https://github.com/microsoft/WSL/issues/4739).
+
+wsldrive already carries every far-side change across as an invalidation, so the mount knows what
+happened within milliseconds. It turns each one into a real kernel event by replaying the operation
+on the mount itself — a write becomes an mtime-only `utimensat` (`IN_MODIFY`), a creation a `mknodat`
+(`IN_CREATE`), a rename a `renameat`, so the two halves arrive paired under one cookie rather than as
+an unrelated delete and create. The events are the kernel's own, so any watcher sees them.
+
+On by default. `wsldrive mount --no-inotify` turns it off. Mechanism, guarantees and the two things
+it does not cover: [`docs/inotify.md`](docs/inotify.md).
 
 ### What gets served (and what doesn't)
 
@@ -323,7 +344,8 @@ detected (Linux) — so CI and minimal builds are unaffected.
 `src/core` — platform-independent library (metadata tree, string pool, framed protocol, coalescer,
 auth token, ignore rules, name escaping, path utils), all unit-tested. `src/net` — sockets
 (TCP/vsock/hvsocket) and the framed channel. `src/platform` — watchers and process launchers per OS.
-`src/agent` — the scanner, `RootServer`, and the `RemoteRoot` client. `src/mount` — the FUSE3 mount.
+`src/agent` — the scanner, `RootServer`, and the `RemoteRoot` client. `src/mount` — the FUSE3 mount
+and the `inotify` bridge.
 `src/tools` — the `wsldrive` and `wsldrived` binaries. `tests`, `bench`, `scripts` as named.
 
 ## Security

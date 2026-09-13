@@ -2,6 +2,7 @@
 
 #include "agent/client.hpp"
 #include "core/error.hpp"
+#include "mount/fsnotify_bridge.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -31,7 +32,16 @@ class FuseMount {
   /// starts serving. Returns once the volume is up. With `writeback`, writes to
   /// a file are buffered and coalesced, flushed on fsync/flush/release — fewer
   /// round-trips, at the cost of durability only at flush/close (opt-in).
-  [[nodiscard]] Result<void> mount(const std::string& mountpoint, bool writeback = false);
+  ///
+  /// With `notify_changes`, far-side changes are also delivered to local
+  /// `inotify` watchers, so watch-mode tools react to edits made on the other
+  /// side of the boundary (see FsNotifyBridge). Linux only; ignored elsewhere.
+  [[nodiscard]] Result<void> mount(const std::string& mountpoint, bool writeback = false,
+                                   bool notify_changes = true);
+
+  /// Counters for the change-notification bridge; all zero when it is off.
+  [[nodiscard]] FsNotifyBridge::Stats notify_stats() const { return notify_.stats(); }
+  [[nodiscard]] bool notifying() const noexcept { return notify_.running(); }
 
   /// Signals the FUSE loop to exit, unmounts, and joins the loop thread.
   void unmount();
@@ -43,6 +53,7 @@ class FuseMount {
   void inval_loop();
 
   agent::RemoteRoot& root_;
+  FsNotifyBridge notify_;
   void* fuse_ = nullptr;  // struct fuse*
   std::string mountpoint_;
   std::thread loop_;

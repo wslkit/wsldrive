@@ -1,6 +1,7 @@
 #include "agent/client.hpp"
 
 #include "core/auth_token.hpp"
+#include "core/coalescer.hpp"
 #include "core/path.hpp"
 #include "core/version.hpp"
 
@@ -568,8 +569,20 @@ void RemoteRoot::rescan_loop() {
       std::lock_guard lock(pf_mu_);
       pf_seen_.clear();
     }
-    std::lock_guard s(stats_mu_);
-    ++stats_.rescans;
+    // Tell the change-notification consumer that the mirror was replaced, now
+    // that it has been. Nothing can name what changed - that is what an
+    // overflow means - so this is the one signal it gets, and it goes out after
+    // the new snapshot has landed rather than when the Rescan arrived.
+    InvalidatedPathsHook paths_hook;
+    {
+      std::lock_guard s(stats_mu_);
+      ++stats_.rescans;
+      paths_hook = paths_hook_;
+    }
+    if (paths_hook) {
+      const AppliedChange rescan_change{ChangeKind::Unknown, std::string{}, 0, NodeKind::Directory, true};
+      paths_hook(std::span<const AppliedChange>(&rescan_change, 1));
+    }
   }
 }
 
@@ -969,11 +982,11 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
   // Directories the batch removes. Collected while the tree can still say they
   // were directories, and swept out of the content cache once the lock is free.
   std::vector<std::string> removed_dirs;
-  // Paths this batch actually changed. An op discarded as stale relative to
+  // What this batch actually changed. An op discarded as stale relative to
   // this client's own mutation did not change the mirror, so it must not be
   // reported as invalidated either - a consumer that drops caches for it would
   // be acting on an event we already decided was obsolete.
-  std::vector<std::string> applied;
+  std::vector<AppliedChange> applied;
   {
     std::unique_lock lock(tree_mu_);
     for (const proto::InvalidationOp& op : batch->ops) {
@@ -987,14 +1000,36 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
           local_mutations_.erase(it);                      // caught up; back to normal
         }
       }
-      if (op.kind != InvalidationKind::Rescan) applied.push_back(op.path);
       switch (op.kind) {
-        case InvalidationKind::Upsert: (void)tree_.upsert_path(op.path, op.attr); break;
-        case InvalidationKind::Remove:
-          if (const auto id = tree_.lookup(op.path, mode()); id && tree_.node(*id).is_dir())
-            removed_dirs.push_back(op.path);
+        case InvalidationKind::Upsert: {
+          // Created or modified is decided here, against the mirror, because
+          // this is the only side that knows what it held a moment ago. The
+          // agent cannot tell the two apart: both look like "the path exists
+          // and something touched it" from a stat after the fact.
+          const bool existed = tree_.lookup(op.path, mode()).has_value();
+          ChangeKind change = op.change;
+          if (!is_move(change)) change = existed ? ChangeKind::Modified : ChangeKind::Created;
+          applied.push_back(AppliedChange{change, op.path, op.cookie, op.attr.kind, false});
+          (void)tree_.upsert_path(op.path, op.attr);
+          break;
+        }
+        case InvalidationKind::Remove: {
+          const auto id = tree_.lookup(op.path, mode());
+          if (id && tree_.node(*id).is_dir()) removed_dirs.push_back(op.path);
+          // Nothing was there to remove. The mirror is already right, and a
+          // consumer told a path it never saw has gone away would report a
+          // deletion that never happened. The source half of a move is the
+          // exception: its partner's arrival is real either way, and dropping
+          // half of a pair costs the consumer the move.
+          if (id || op.change == ChangeKind::MovedFrom) {
+            const NodeKind kind = id ? tree_.node(*id).attr.kind : NodeKind::File;
+            applied.push_back(AppliedChange{op.change == ChangeKind::MovedFrom ? ChangeKind::MovedFrom
+                                                                               : ChangeKind::Removed,
+                                            op.path, op.cookie, kind, false});
+          }
           (void)tree_.remove_path(op.path, mode());
           break;
+        }
         case InvalidationKind::Rescan: rescan = true; break;  // handled below, off this thread
       }
     }
@@ -1009,6 +1044,11 @@ void RemoteRoot::apply_invalidation(std::span<const std::byte> payload) {
       else snapshot_replay_overflow_ = true;
     }
   }
+  // Dropping a removal for a path the mirror never had can strand the other
+  // half of a move, and so can a frame boundary: a batch too large for one
+  // frame is broadcast in several, and the two halves may land in different
+  // ones. Either way the surviving half is degraded rather than left dangling.
+  repair_move_pairs(applied);
   for (const std::string& d : removed_dirs) drop_cached_prefix(d);
   if (rescan) {
     // The agent's watcher overflowed: per-path events were lost, so the mirror
