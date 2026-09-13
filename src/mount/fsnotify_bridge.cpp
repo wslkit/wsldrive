@@ -318,6 +318,11 @@ bool FsNotifyBridge::poke_remove(const Job& job) {
   const std::string p = abs(job.path);
   const int rc = dir ? ::rmdir(p.c_str()) : ::unlink(p.c_str());
   clear_active();
+  // On success the removal itself drops the ghost dentry. On failure it does
+  // not, and the kernel is left holding an entry built from the fiction — so a
+  // path the far side deleted would read as still there, to anyone, until the
+  // entry cache lets go of it. Drop it explicitly instead.
+  if (rc != 0 && invalidate_) invalidate_(job.path);
   return rc == 0;
 }
 
@@ -344,7 +349,11 @@ bool FsNotifyBridge::poke_move(const Job& job) {
   // The invalidation hook queues a punch for both paths anyway, but on another
   // thread and with no ordering against this one, so it cannot be relied on to
   // land after the rename.
-  if (rc == 0 && invalidate_) invalidate_(job.path2);
+  //
+  // A rename that failed leaves the ghost where it was built, on the source —
+  // a path the far side has moved away from, reading as still present to
+  // anyone who looks within the entry cache's lifetime. Drop that instead.
+  if (invalidate_) invalidate_(rc == 0 ? job.path2 : job.path);
   return rc == 0;
 }
 

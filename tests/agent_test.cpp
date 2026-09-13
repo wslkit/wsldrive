@@ -1088,7 +1088,9 @@ TEST_F(AgentTest, ChangeKindsReachTheClient) {
   {
     std::lock_guard lock(mu);
     for (const auto& c : seen) {
-      if (c.path == "Docs") EXPECT_EQ(c.kind, NodeKind::Directory);
+      if (c.path == "Docs") {
+        EXPECT_EQ(c.kind, NodeKind::Directory);
+      }
     }
   }
 }
