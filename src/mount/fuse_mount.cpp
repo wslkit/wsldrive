@@ -278,6 +278,17 @@ int err_to_errno(Errc e) {
 
 int op_create(const char* path, ModeT mode, struct fuse_file_info* fi) {
   const std::string rel = to_rel(path);
+  // A creation poke arrives here, not at op_mknod. libfuse's FUSE_MKNOD handler
+  // tries `create` first for a regular file and only falls back to `mknod` if
+  // that answers ENOSYS, so the mount having a `create` means `mknod` is never
+  // reached for the case the bridge uses. Missing this cost the far side a
+  // file: the poke was forwarded as a genuine create, which replaces the file
+  // whose arrival prompted the notification with an empty one.
+  switch (claim_poke(FsNotifyBridge::Poke::Mknod, rel)) {
+    case PokeVerdict::Claimed: return 0;  // fi->fh stays 0: no write handle, nothing to release
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
   auto r = ctx()->root->create_file(rel, static_cast<std::uint32_t>(mode) & 0777u);
   if (!r) return err_to_errno(r.error());
   if (ctx()->writeback && fi != nullptr)

@@ -49,6 +49,16 @@ is deliberately over-determined, because the cost of getting it wrong is a user'
 removing anything: the request must come from the bridge's own thread, a poke of exactly that kind
 must be in flight, and it must name exactly that path. A poke is claimed once and then retired.
 
+The recognition has to cover every handler the poke can reach, which is not always the obvious one.
+A `mknodat` of a regular file arrives as `FUSE_MKNOD`, but libfuse offers it to the `create` handler
+first and only falls back to `mknod` if that answers `ENOSYS` — so a mount with a `create` handler
+never sees the poke at `mknod` at all. Getting that wrong is not a missed event; it forwards the
+poke as a genuine creation and replaces the file that prompted it with an empty one.
+
+Which is why an unrecognised request from the bridge's thread is refused rather than forwarded. The
+bridge performs no genuine mutations, so a mutation from its thread is one of its own replays and
+nothing else. A refused poke costs a notification; a forwarded one costs data.
+
 Two further guards keep the replay inside the mount. The bridge refuses to start unless its root is
 a FUSE mount (`statfs` reports `FUSE_SUPER_MAGIC`), and every poke re-checks that its target's
 parent is still on that mount's device. Both exist because the pokes are real filesystem calls: aimed
