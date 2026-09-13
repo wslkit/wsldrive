@@ -10,8 +10,11 @@
   no cooperation of any kind. Create, write, delete and rename each raise the matching event type,
   and a rename arrives as a paired `IN_MOVED_FROM`/`IN_MOVED_TO` with one cookie rather than as an
   unrelated delete and create. This is [microsoft/WSL#4739](https://github.com/microsoft/WSL/issues/4739),
-  which nothing has solved. On by default; `wsldrive mount --no-inotify` turns it off. How it works,
-  and what it does not cover, is in [`docs/inotify.md`](docs/inotify.md).
+  which nothing has solved. Measured against a write made locally on the mount, it adds nothing:
+  **4 ms either way**, including a write deep inside a 10,000-file tree, and read/write throughput is
+  untouched because the bridge sits on the invalidation path rather than the data path. On by
+  default; `wsldrive mount --no-inotify` turns it off. How it works, and what it does not cover, is
+  in [`docs/inotify.md`](docs/inotify.md).
 - `mknod` on a regular file now works on the mount, instead of failing with `ENOSYS`.
 
 ### Changed

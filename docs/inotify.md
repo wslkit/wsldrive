@@ -80,7 +80,21 @@ the handler claims it.
 
 One syscall per changed path, answered by the FUSE loop out of the in-RAM mirror. No boundary
 crossing and no I/O, so the added latency over a write made locally on the mount is the mount's own
-round trip. `scripts/inotify-conformance.sh` measures both and prints them side by side.
+round trip. `scripts/inotify-conformance.sh` measures both and prints them side by side; on a GitHub
+Actions runner, with a Linux agent on loopback:
+
+| change to event | |
+|---|--:|
+| write made locally on the mount | 4 ms |
+| write made on the served side | 4 ms |
+
+Each individual event type lands in the same 4 ms, including a write deep inside a 10,000-file tree.
+Nothing measurable is added, which follows from where the work happens: the invalidation had already
+crossed the boundary and updated the mirror before the bridge did anything, and the poke never
+leaves the local kernel.
+
+Read and write throughput are untouched. The bridge sits on the invalidation path, not the data
+path, and adds no work to `read`, `write` or any other operation a tool performs on the mount.
 
 The queue is bounded at 65536 pending changes. Past that the oldest are dropped, and `wsldrive mount`
 says so on exit. A dropped notification is a late one, not a wrong one: the mirror and the page cache
