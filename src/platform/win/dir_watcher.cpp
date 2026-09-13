@@ -105,23 +105,47 @@ class Win32Watcher final : public Watcher {
       for (char& c : path)
         if (c == '\\') c = '/';
       FsEventKind kind;
+      // ReadDirectoryChangesW has no equivalent of inotify's rename cookie: it
+      // reports the two halves as OLD_NAME immediately followed by NEW_NAME in
+      // the same buffer. Mint a cookie on the OLD_NAME and hand the same one to
+      // the NEW_NAME that follows, so a consumer can pair them the way it pairs
+      // an inotify move. Anything other than a NEW_NAME clears the pending
+      // cookie, which leaves a truncated pair unpaired rather than joined to
+      // the wrong partner.
+      std::uint32_t cookie = 0;
       switch (info->Action) {
         case FILE_ACTION_ADDED: kind = FsEventKind::Created; break;
         case FILE_ACTION_REMOVED: kind = FsEventKind::Removed; break;
         case FILE_ACTION_MODIFIED: kind = FsEventKind::Modified; break;
-        case FILE_ACTION_RENAMED_OLD_NAME: kind = FsEventKind::RenamedFrom; break;
-        case FILE_ACTION_RENAMED_NEW_NAME: kind = FsEventKind::RenamedTo; break;
+        case FILE_ACTION_RENAMED_OLD_NAME:
+          kind = FsEventKind::RenamedFrom;
+          cookie = next_cookie();
+          pending_cookie_ = cookie;
+          break;
+        case FILE_ACTION_RENAMED_NEW_NAME:
+          kind = FsEventKind::RenamedTo;
+          cookie = pending_cookie_ != 0 ? pending_cookie_ : next_cookie();
+          break;
         default: kind = FsEventKind::Modified; break;
       }
-      cb_(FsEvent{kind, path});
+      if (info->Action != FILE_ACTION_RENAMED_OLD_NAME) pending_cookie_ = 0;
+      cb_(FsEvent{kind, path, cookie});
       if (info->NextEntryOffset == 0) break;
       off += info->NextEntryOffset;
     }
   }
 
+  // Never returns 0: zero is the "no pair" marker downstream.
+  std::uint32_t next_cookie() noexcept {
+    if (++cookie_seq_ == 0) ++cookie_seq_;
+    return cookie_seq_;
+  }
+
   HANDLE dir_;
   HANDLE iocp_;
   WatchCallback cb_;
+  std::uint32_t cookie_seq_ = 0;
+  std::uint32_t pending_cookie_ = 0;  // cookie of an OLD_NAME awaiting its NEW_NAME
   OVERLAPPED ov_{};
   // Heap-allocated, so `new` gives it stricter alignment than
   // FILE_NOTIFY_INFORMATION needs.

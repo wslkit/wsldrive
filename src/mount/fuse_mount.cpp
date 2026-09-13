@@ -16,8 +16,12 @@ using StatvfsT = struct fuse_statvfs;
 using OffT = fuse_off_t;
 using ModeT = fuse_mode_t;
 using TimespecT = struct fuse_timespec;
+using DevT = fuse_dev_t;
 #ifndef S_IFLNK
 #define S_IFLNK 0120000
+#endif
+#ifndef S_IFMT
+#define S_IFMT 0170000
 #endif
 #else
 #define FUSE_USE_VERSION 31
@@ -30,6 +34,7 @@ using StatvfsT = struct statvfs;
 using OffT = off_t;
 using ModeT = mode_t;
 using TimespecT = struct timespec;
+using DevT = dev_t;
 #endif
 
 #include <algorithm>
@@ -52,6 +57,10 @@ namespace {
 struct Context {
   agent::RemoteRoot* root;
   bool writeback = false;
+  // Non-null only where change notification is on (Linux). The handlers below
+  // consult it before acting, because a handful of the requests they see are
+  // the bridge's own and must be answered here rather than forwarded.
+  FsNotifyBridge* notify = nullptr;
 };
 
 Context* ctx() { return static_cast<Context*>(fuse_get_context()->private_data); }
@@ -159,8 +168,58 @@ void fill_stat(const MetadataTree::Node& n, StatT* st) {
   st->st_ctim = st->st_mtim;
 }
 
+// The change-notification bridge's own requests, if there is one. Each returns
+// false the moment notification is off, so the ordinary path is one null check.
+int caller_pid() {
+  const struct fuse_context* c = fuse_get_context();
+  return c != nullptr ? static_cast<int>(c->pid) : 0;
+}
+
+enum class PokeVerdict {
+  NotOurs,  // an ordinary request; forward it across the boundary
+  Claimed,  // the poke we are waiting for; answer it here and raise the event
+  Refuse,   // from the bridge's thread but not the poke we expected; see below
+};
+
+// A mutation request from the bridge's own thread is never forwarded, even when
+// it is not the poke that was expected. The bridge issues no genuine mutations,
+// so forwarding one could only re-apply a change the far side already made —
+// and for a creation that means replacing the file whose arrival prompted the
+// notification with an empty one. A refused poke costs a missed event; a
+// forwarded one costs data.
+PokeVerdict claim_poke(FsNotifyBridge::Poke what, std::string_view rel, std::string_view rel2 = {}) {
+  FsNotifyBridge* b = ctx()->notify;
+  if (b == nullptr) return PokeVerdict::NotOurs;
+  const int caller = caller_pid();
+  if (b->claim(caller, what, rel, rel2)) return PokeVerdict::Claimed;
+  return b->is_poke_thread(caller) ? PokeVerdict::Refuse : PokeVerdict::NotOurs;
+}
+
+// Fills `st` with a minimal stat for a path the mirror no longer has, so the
+// bridge's own removal or rename can proceed far enough for the kernel to raise
+// the event. Only ever returned to the bridge's thread.
+void fill_ghost_stat(NodeKind kind, StatT* st) {
+  std::memset(st, 0, sizeof(*st));
+#ifndef _WIN32
+  st->st_uid = ::getuid();
+  st->st_gid = ::getgid();
+#endif
+  st->st_mode = static_cast<ModeT>(kind == NodeKind::Directory ? (S_IFDIR | 0755) : (S_IFREG | 0644));
+  st->st_nlink = kind == NodeKind::Directory ? 2 : 1;
+}
+
 int op_getattr(const char* path, StatT* st, struct fuse_file_info*) {
   const std::string rel = to_rel(path);
+  if (FsNotifyBridge* b = ctx()->notify; b != nullptr) {
+    NodeKind kind = NodeKind::File;
+    switch (b->pretend(caller_pid(), rel, kind)) {
+      case FsNotifyBridge::Pretend::Absent: return -ENOENT;  // so ->mknod / ->mkdir runs
+      case FsNotifyBridge::Pretend::Present:                 // so ->unlink / ->rename runs
+        fill_ghost_stat(kind, st);
+        return 0;
+      case FsNotifyBridge::Pretend::Nothing: break;
+    }
+  }
   return ctx()->root->with_tree([&](const MetadataTree& t) -> int {
     const auto id = t.lookup(rel, LookupMode::CaseInsensitive);
     if (!id) return -ENOENT;
@@ -219,6 +278,17 @@ int err_to_errno(Errc e) {
 
 int op_create(const char* path, ModeT mode, struct fuse_file_info* fi) {
   const std::string rel = to_rel(path);
+  // A creation poke arrives here, not at op_mknod. libfuse's FUSE_MKNOD handler
+  // tries `create` first for a regular file and only falls back to `mknod` if
+  // that answers ENOSYS, so the mount having a `create` means `mknod` is never
+  // reached for the case the bridge uses. Missing this cost the far side a
+  // file: the poke was forwarded as a genuine create, which replaces the file
+  // whose arrival prompted the notification with an empty one.
+  switch (claim_poke(FsNotifyBridge::Poke::Mknod, rel)) {
+    case PokeVerdict::Claimed: return 0;  // fi->fh stays 0: no write handle, nothing to release
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
   auto r = ctx()->root->create_file(rel, static_cast<std::uint32_t>(mode) & 0777u);
   if (!r) return err_to_errno(r.error());
   if (ctx()->writeback && fi != nullptr)
@@ -272,23 +342,65 @@ int op_truncate(const char* path, OffT size, struct fuse_file_info*) {
   return r ? 0 : err_to_errno(r.error());
 }
 
+// Not previously implemented, which made `mknod` fail with ENOSYS. It is here
+// because the change-notification bridge creates a file through it — the kernel
+// routes mknod of a regular file to ->create, which is what raises IN_CREATE —
+// but the forwarding path below is a real gain of its own: tools that reach for
+// mknod instead of open(O_CREAT) now work on the mount.
+int op_mknod(const char* path, ModeT mode, DevT) {
+  const std::string rel = to_rel(path);
+  switch (claim_poke(FsNotifyBridge::Poke::Mknod, rel)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
+  if ((mode & S_IFMT) != 0 && (mode & S_IFMT) != S_IFREG) return -EPERM;  // no devices across the boundary
+  auto r = ctx()->root->create_file(rel, static_cast<std::uint32_t>(mode) & 0777u);
+  return r ? 0 : err_to_errno(r.error());
+}
+
 int op_mkdir(const char* path, ModeT mode) {
-  auto r = ctx()->root->mkdir(to_rel(path), static_cast<std::uint32_t>(mode) & 0777u);
+  const std::string rel = to_rel(path);
+  switch (claim_poke(FsNotifyBridge::Poke::Mkdir, rel)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
+  auto r = ctx()->root->mkdir(rel, static_cast<std::uint32_t>(mode) & 0777u);
   return r ? 0 : err_to_errno(r.error());
 }
 
 int op_unlink(const char* path) {
-  auto r = ctx()->root->unlink(to_rel(path));
+  const std::string rel = to_rel(path);
+  switch (claim_poke(FsNotifyBridge::Poke::Unlink, rel)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
+  auto r = ctx()->root->unlink(rel);
   return r ? 0 : err_to_errno(r.error());
 }
 
 int op_rmdir(const char* path) {
-  auto r = ctx()->root->rmdir(to_rel(path));
+  const std::string rel = to_rel(path);
+  switch (claim_poke(FsNotifyBridge::Poke::Rmdir, rel)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
+  auto r = ctx()->root->rmdir(rel);
   return r ? 0 : err_to_errno(r.error());
 }
 
 int op_rename(const char* from, const char* to, unsigned int) {
-  auto r = ctx()->root->rename(to_rel(from), to_rel(to));
+  const std::string rfrom = to_rel(from);
+  const std::string rto = to_rel(to);
+  switch (claim_poke(FsNotifyBridge::Poke::Rename, rfrom, rto)) {
+    case PokeVerdict::Claimed: return 0;
+    case PokeVerdict::Refuse: return -EIO;
+    case PokeVerdict::NotOurs: break;
+  }
+  auto r = ctx()->root->rename(rfrom, rto);
   return r ? 0 : err_to_errno(r.error());
 }
 
@@ -436,6 +548,7 @@ fuse_operations make_ops() {
   ops.create = op_create;
   ops.write = op_write;
   ops.truncate = op_truncate;
+  ops.mknod = op_mknod;
   ops.mkdir = op_mkdir;
   ops.unlink = op_unlink;
   ops.rmdir = op_rmdir;
@@ -454,7 +567,7 @@ fuse_operations make_ops() {
 
 FuseMount::~FuseMount() { unmount(); }
 
-Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
+Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback, bool notify_changes) {
 #ifdef _WIN32
   if (!load_winfsp_dll()) return fail(Errc::Unsupported);
 #endif
@@ -468,6 +581,10 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
   // read-ahead, and - against a case-sensitive agent - the file itself.
   root_.set_lookup_mode(LookupMode::CaseInsensitive);
   context.writeback = writeback;
+  // Wired in before the loop starts so no request can reach a handler while
+  // this is half-set; the bridge itself is started further down, once there is
+  // a live mount for it to poke.
+  context.notify = notify_changes && FsNotifyBridge::supported() ? &notify_ : nullptr;
   static fuse_operations ops = make_ops();
 
   struct fuse_args args = FUSE_ARGS_INIT(0, nullptr);
@@ -513,14 +630,21 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
   // relative to its own mutation changed nothing, and punching for it would act
   // on an event already judged obsolete. This also leaves the raw-batch
   // InvalidationHook free for `wsldrive watch`.
-  root_.set_invalidated_paths_hook([this](std::span<const std::string> paths) {
-    std::lock_guard lock(inval_mu_);
-    if (inval_stop_) return;
-    for (const std::string& p : paths) {
-      if (inval_queue_.size() >= kInvalQueueCap) break;
-      inval_queue_.push_back(to_fuse_path(p));
+  root_.set_invalidated_paths_hook([this](std::span<const agent::RemoteRoot::AppliedChange> changes) {
+    // Two consumers of the same signal, and they want different things from it.
+    // The page-cache punch only needs to know which paths moved on; the
+    // notification bridge needs to know what happened to each of them.
+    {
+      std::lock_guard lock(inval_mu_);
+      if (inval_stop_) return;
+      for (const auto& c : changes) {
+        if (c.rescan) continue;  // no path to punch; the whole mirror was replaced
+        if (inval_queue_.size() >= kInvalQueueCap) break;
+        inval_queue_.push_back(to_fuse_path(c.path));
+      }
+      inval_cv_.notify_one();
     }
-    inval_cv_.notify_one();
+    notify_.post(changes);
   });
 
   loop_ = std::thread([this] {
@@ -551,6 +675,20 @@ Result<void> FuseMount::mount(const std::string& mountpoint, bool writeback) {
     fuse_loop(static_cast<struct fuse*>(fuse_));
     mounted_.store(false);
   });
+
+  // Last, because the bridge's first act is to confirm it is pointed at a live
+  // FUSE mount, and nothing answers a request on this mount until the loop
+  // above is running. It does that on its own thread, so this does not wait.
+  if (context.notify != nullptr) {
+    notify_.set_invalidate([this](const std::string& rel) {
+      std::lock_guard lock(inval_mu_);
+      if (inval_stop_ || inval_queue_.size() >= kInvalQueueCap) return;
+      inval_queue_.push_back(to_fuse_path(rel));
+      inval_cv_.notify_one();
+    });
+    if (auto r = notify_.start(mountpoint); !r)
+      std::fprintf(stderr, "wsldrive: change notification unavailable on this platform\n");
+  }
   return {};
 }
 
@@ -576,6 +714,9 @@ void FuseMount::unmount() {
   // Stop feeding the invalidation thread, and join it, before the fuse handle
   // it dereferences goes away. Harmless where the thread was never started.
   root_.set_invalidated_paths_hook({});
+  // The bridge issues filesystem calls against this mount, so it has to be
+  // stopped and joined before the mount is torn out from under it.
+  notify_.stop();
   {
     std::lock_guard lock(inval_mu_);
     inval_stop_ = true;

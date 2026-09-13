@@ -140,5 +140,127 @@ TEST(Coalescer, MarksEntriesThatAppeared) {
   EXPECT_TRUE(find("gone").appeared);
 }
 
+// --- change kinds and rename pairing (the inotify bridge's input) ------------
+
+// Every consumer downstream keys off `change`, and the whole point of keeping
+// it separate from `kind` is that a burst collapses to one op without losing
+// what the burst was.
+TEST(Coalescer, ChangeKindSurvivesCollapsing) {
+  Coalescer c;
+  c.push({FsEventKind::Created, "new.txt"}, t0);
+  c.push({FsEventKind::Modified, "new.txt"}, t0);  // still a creation, not a modification
+  c.push({FsEventKind::Modified, "old.txt"}, t0);
+  c.push({FsEventKind::Created, "gone.txt"}, t0);
+  c.push({FsEventKind::Removed, "gone.txt"}, t0);  // last event wins
+
+  auto out = c.take();
+  auto change_of = [&](std::string_view p) {
+    for (const auto& op : out)
+      if (op.path == p) return op.change;
+    return ChangeKind::Unknown;
+  };
+  EXPECT_EQ(change_of("new.txt"), ChangeKind::Created);
+  EXPECT_EQ(change_of("old.txt"), ChangeKind::Modified);
+  EXPECT_EQ(change_of("gone.txt"), ChangeKind::Removed);
+}
+
+TEST(Coalescer, RenamePairSharesACookie) {
+  Coalescer c;
+  c.push({FsEventKind::RenamedFrom, "old.txt", 77}, t0);
+  c.push({FsEventKind::RenamedTo, "new.txt", 77}, t0);
+
+  auto out = c.take();
+  ASSERT_EQ(out.size(), 2u);
+  EXPECT_EQ(out[0].change, ChangeKind::MovedFrom);
+  EXPECT_EQ(out[0].path, "old.txt");
+  EXPECT_EQ(out[1].change, ChangeKind::MovedTo);
+  EXPECT_EQ(out[1].path, "new.txt");
+  EXPECT_EQ(out[0].cookie, 77u);
+  EXPECT_EQ(out[1].cookie, 77u);
+}
+
+// A write to the destination after the move must not cost the pairing: the
+// consumer still has to see one move rather than a delete and an unrelated
+// write. This is the git lock-file dance (rename into place, then touch).
+TEST(Coalescer, WriteAfterMoveKeepsThePair) {
+  Coalescer c;
+  c.push({FsEventKind::RenamedFrom, "a", 5}, t0);
+  c.push({FsEventKind::RenamedTo, "b", 5}, t0);
+  c.push({FsEventKind::Modified, "b"}, t0);
+
+  auto out = c.take();
+  ASSERT_EQ(out.size(), 2u);
+  EXPECT_EQ(out[0].change, ChangeKind::MovedFrom);
+  EXPECT_EQ(out[1].change, ChangeKind::MovedTo);
+  EXPECT_EQ(out[1].cookie, 5u);
+}
+
+// The source coming back under its old name is exactly what git does, and it
+// leaves the destination's half with nobody to pair with. A half-move must not
+// reach a consumer: on its own the destination simply appeared.
+TEST(Coalescer, StrandedMoveHalfDegrades) {
+  Coalescer c;
+  c.push({FsEventKind::RenamedFrom, "config", 9}, t0);
+  c.push({FsEventKind::RenamedTo, "config.lock", 9}, t0);
+  c.push({FsEventKind::Created, "config", 0}, t0);  // recreated, so it is no longer a move source
+
+  auto out = c.take();
+  ASSERT_EQ(out.size(), 2u);
+  for (const auto& op : out) {
+    EXPECT_FALSE(is_move(op.change)) << op.path;
+    EXPECT_EQ(op.cookie, 0u) << op.path;
+    EXPECT_EQ(op.change, ChangeKind::Created) << op.path;
+  }
+}
+
+// The other direction: a removed directory takes the destination out of the
+// batch, so the source is left as the surviving half.
+TEST(Coalescer, MoveIntoARemovedDirectoryDegradesToRemoval) {
+  Coalescer c;
+  c.push({FsEventKind::RenamedFrom, "src.txt", 3}, t0);
+  c.push({FsEventKind::RenamedTo, "dir/dst.txt", 3}, t0);
+  c.push({FsEventKind::Removed, "dir"}, t0);  // drops dir/dst.txt with it
+
+  auto out = c.take();
+  ASSERT_EQ(out.size(), 2u);
+  auto change_of = [&](std::string_view p) {
+    for (const auto& op : out)
+      if (op.path == p) return op.change;
+    return ChangeKind::Unknown;
+  };
+  EXPECT_EQ(change_of("src.txt"), ChangeKind::Removed);
+  EXPECT_EQ(change_of("dir"), ChangeKind::Removed);
+}
+
+TEST(Coalescer, OverflowCarriesNoChangeKind) {
+  Coalescer c;
+  c.push({FsEventKind::Created, "a"}, t0);
+  c.push({FsEventKind::Overflow, {}}, t0);
+  auto out = c.take();
+  ASSERT_EQ(out.size(), 1u);
+  EXPECT_EQ(out[0].kind, InvalidationKind::Rescan);
+  EXPECT_EQ(out[0].change, ChangeKind::Unknown);
+}
+
+// repair_move_pairs is applied again by the sender and by the receiver, on
+// their own op types, so it is exercised directly here too.
+TEST(RepairMovePairs, MatchedPairSurvivesAndOrphansDegrade) {
+  std::vector<PlannedOp> ops{
+      PlannedOp{InvalidationKind::Remove, "a", false, ChangeKind::MovedFrom, 1},
+      PlannedOp{InvalidationKind::Upsert, "b", true, ChangeKind::MovedTo, 1},
+      PlannedOp{InvalidationKind::Upsert, "c", true, ChangeKind::MovedTo, 2},   // no partner
+      PlannedOp{InvalidationKind::Remove, "d", false, ChangeKind::MovedFrom, 3},  // no partner
+      PlannedOp{InvalidationKind::Upsert, "e", true, ChangeKind::MovedTo, 0},   // no cookie at all
+  };
+  repair_move_pairs(ops);
+  EXPECT_EQ(ops[0].change, ChangeKind::MovedFrom);
+  EXPECT_EQ(ops[1].change, ChangeKind::MovedTo);
+  EXPECT_EQ(ops[2].change, ChangeKind::Created);
+  EXPECT_EQ(ops[3].change, ChangeKind::Removed);
+  EXPECT_EQ(ops[4].change, ChangeKind::Created);
+  EXPECT_EQ(ops[2].cookie, 0u);
+  EXPECT_EQ(ops[3].cookie, 0u);
+}
+
 }  // namespace
 }  // namespace wsld

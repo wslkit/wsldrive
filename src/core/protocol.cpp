@@ -264,6 +264,10 @@ void write_invalidation(Writer& w, const InvalidationBatch& b) {
     w.u8(static_cast<std::uint8_t>(op.kind));
     w.string(op.path);
     if (op.kind == InvalidationKind::Upsert) write_attributes(w, op.attr);
+    // One extra byte per op in the common case; the cookie rides along only for
+    // the two move kinds, which are a small minority of any real batch.
+    w.u8(static_cast<std::uint8_t>(op.change));
+    if (is_move(op.change)) w.u32(op.cookie);
   }
 }
 
@@ -289,6 +293,15 @@ Result<InvalidationBatch> read_invalidation(Reader& r) noexcept {
       auto attr = read_attributes(r);
       if (!attr) return fail(attr.error());
       op.attr = *attr;
+    }
+    auto change = r.u8();
+    if (!change) return fail(change.error());
+    if (*change > kMaxChangeKind) return fail(Errc::Corrupt);
+    op.change = static_cast<ChangeKind>(*change);
+    if (is_move(op.change)) {
+      auto cookie = r.u32();
+      if (!cookie) return fail(cookie.error());
+      op.cookie = *cookie;
     }
     b.ops.push_back(std::move(op));
   }

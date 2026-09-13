@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Added
+
+- **File changes made on the Windows side now fire `inotify` inside WSL.** A Direction B mount
+  delivers far-side changes to ordinary Linux watchers, so `vite`, `nodemon`, `tsc --watch`,
+  `jest --watch`, `air` and `cargo-watch` react to an edit made from a Windows editor. Watchers need
+  no cooperation of any kind. Create, write, delete and rename each raise the matching event type,
+  and a rename arrives as a paired `IN_MOVED_FROM`/`IN_MOVED_TO` with one cookie rather than as an
+  unrelated delete and create. This is [microsoft/WSL#4739](https://github.com/microsoft/WSL/issues/4739),
+  which nothing has solved. Measured against a write made locally on the mount, it adds nothing:
+  **4 ms either way**, including a write deep inside a 10,000-file tree, and read/write throughput is
+  untouched because the bridge sits on the invalidation path rather than the data path. On by
+  default; `wsldrive mount --no-inotify` turns it off. How it works, and what it does not cover, is
+  in [`docs/inotify.md`](docs/inotify.md).
+- `mknod` on a regular file now works on the mount, instead of failing with `ENOSYS`.
+
+### Changed
+
+- The wire protocol is at version 4. Every invalidation op carries what the watcher actually saw
+  (created, modified, removed, or one half of a move) alongside what the mirror should do about it,
+  plus a cookie pairing the two halves of a rename. A peer that ignores both fields stays correct.
+  The agent and the client must be the same version, as before.
+
 ### Performance
 
 - **The mount lets the kernel cache file pages.** `auto_cache` replaces

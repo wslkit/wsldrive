@@ -156,14 +156,18 @@ class InotifyWatcher final : public Watcher {
     const std::string rel = join_rel(dir, ev.name);
     const bool is_dir = (ev.mask & IN_ISDIR) != 0;
 
+    // inotify already pairs the two halves of a move with a cookie; pass it
+    // straight through. It is only set on IN_MOVED_FROM/IN_MOVED_TO.
     if (ev.mask & (IN_CREATE | IN_MOVED_TO)) {
       if (is_dir) add_watch_recursive(root_ / std::filesystem::path(rel), rel);
-      cb_(FsEvent{ev.mask & IN_MOVED_TO ? FsEventKind::RenamedTo : FsEventKind::Created, rel});
+      const bool moved = (ev.mask & IN_MOVED_TO) != 0;
+      cb_(FsEvent{moved ? FsEventKind::RenamedTo : FsEventKind::Created, rel, moved ? ev.cookie : 0});
       // A directory may have been populated before we armed the watch; a scan/rescan
       // on the consumer side covers that. For files, CLOSE_WRITE will follow.
     } else if (ev.mask & (IN_DELETE | IN_MOVED_FROM)) {
       if (is_dir) drop_watch_subtree(rel);
-      cb_(FsEvent{ev.mask & IN_MOVED_FROM ? FsEventKind::RenamedFrom : FsEventKind::Removed, rel});
+      const bool moved = (ev.mask & IN_MOVED_FROM) != 0;
+      cb_(FsEvent{moved ? FsEventKind::RenamedFrom : FsEventKind::Removed, rel, moved ? ev.cookie : 0});
     } else if (ev.mask & (IN_MODIFY | IN_CLOSE_WRITE | IN_ATTRIB)) {
       cb_(FsEvent{FsEventKind::Modified, rel});
     }

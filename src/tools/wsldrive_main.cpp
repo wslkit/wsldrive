@@ -141,7 +141,8 @@ void usage() {
       "                                                       (check the WinFsp + WSL environment)\n"
 #endif
 #ifdef WSLDRIVE_HAVE_MOUNT
-      "  wsldrive mount <mountpoint> --connect <endpoint> [--writeback] [--no-prefetch]  (attach to an agent)\n"
+      "  wsldrive mount <mountpoint> --connect <endpoint> [--writeback] [--no-prefetch] [--no-inotify]\n"
+      "                                                       (attach to an agent)\n"
 #endif
 #if defined(WSLDRIVE_HAVE_MOUNT) && !defined(_WIN32)
       "  wsldrive mount <dir> --win-root <winpath> --win-agent <wsldrived.exe> [--hvsocket [--vm-guid G]]\n"
@@ -420,6 +421,7 @@ int main(int argc, char** argv) {
     bool writeback = false;
     bool hvsocket = false;
     bool prefetch = true;
+    bool notify_changes = true;
     std::string vm_guid;
     for (int i = 3; i < argc; ++i) {
       const std::string_view a = argv[i];
@@ -440,6 +442,8 @@ int main(int argc, char** argv) {
         writeback = true;
       else if (a == "--no-prefetch")
         prefetch = false;
+      else if (a == "--no-inotify")
+        notify_changes = false;
       else if (a == "--distro") {
         distro = val();
         have_distro = true;
@@ -649,12 +653,14 @@ int main(int argc, char** argv) {
       if (dirs > 0) std::printf("prefetching %zu directories in the background...\n", dirs);
     }
     wsld::mount::FuseMount fm(root);
-    if (auto r = fm.mount(mountpoint, writeback); !r) {
+    if (auto r = fm.mount(mountpoint, writeback, notify_changes); !r) {
       std::fprintf(stderr, "wsldrive: mount failed: %s\n", wsld::to_string(r.error()));
       return 1;
     }
     install_mount_signal_handler();
     std::printf("mounted. Ctrl+C to unmount.\n");
+    if (notify_changes && wsld::mount::FsNotifyBridge::supported())
+      std::printf("far-side changes are delivered to local inotify watchers (--no-inotify turns this off)\n");
     std::fflush(stdout);
     std::uint64_t rescans_seen = 0, rescan_failures_seen = 0;
     while (fm.mounted() && root.connected() && !g_mount_stop.load()) {
@@ -670,6 +676,14 @@ int main(int argc, char** argv) {
                      static_cast<unsigned long long>(st.rescans), static_cast<unsigned long long>(st.rescan_failures));
       }
     }
+    // Always reported, not only on loss. Change delivery is invisible when it
+    // works and equally invisible when it does not, so a count of what actually
+    // went out is the only way to tell the two apart after the fact.
+    if (const auto ns = fm.notify_stats(); ns.events != 0)
+      std::printf("change notifications: %llu delivered, %llu failed, %llu dropped, %llu rescans (of %llu)\n",
+                  static_cast<unsigned long long>(ns.delivered), static_cast<unsigned long long>(ns.failed),
+                  static_cast<unsigned long long>(ns.dropped), static_cast<unsigned long long>(ns.rescans),
+                  static_cast<unsigned long long>(ns.events));
     std::printf("unmounting...\n");
     std::fflush(stdout);
     fm.unmount();  // agent (if auto-launched) is stopped by its destructor on return
@@ -821,9 +835,24 @@ int main(int argc, char** argv) {
       std::printf("[gen %llu +%lld ms] %zu ops\n", static_cast<unsigned long long>(b.generation),
                   static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now).count() % 100000),
                   b.ops.size());
-      for (const auto& op : b.ops)
-        std::printf("   %s %s\n", op.kind == wsld::InvalidationKind::Upsert ? "upsert" : op.kind == wsld::InvalidationKind::Remove ? "remove" : "rescan",
-                    op.path.c_str());
+      for (const auto& op : b.ops) {
+        const char* change = "";
+        switch (op.change) {
+          case wsld::ChangeKind::Created: change = " (created)"; break;
+          case wsld::ChangeKind::Modified: change = " (modified)"; break;
+          case wsld::ChangeKind::Removed: change = " (removed)"; break;
+          case wsld::ChangeKind::MovedFrom: change = " (moved from)"; break;
+          case wsld::ChangeKind::MovedTo: change = " (moved to)"; break;
+          case wsld::ChangeKind::Unknown: break;
+        }
+        char cookie[32] = "";
+        if (op.cookie != 0) std::snprintf(cookie, sizeof(cookie), " #%u", op.cookie);
+        std::printf("   %s %s%s%s\n",
+                    op.kind == wsld::InvalidationKind::Upsert   ? "upsert"
+                    : op.kind == wsld::InvalidationKind::Remove ? "remove"
+                                                                : "rescan",
+                    op.path.c_str(), change, cookie);
+      }
       std::fflush(stdout);
     });
     while (root.connected()) std::this_thread::sleep_for(std::chrono::milliseconds(200));

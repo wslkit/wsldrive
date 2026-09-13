@@ -22,7 +22,9 @@
 namespace wsld::proto {
 
 inline constexpr std::uint32_t kMagic = 0x444C5357;  // "WSLD" when read as little-endian bytes
-inline constexpr std::uint16_t kVersion = 3;  // 3: mutual handshake (nonces + proofs, no token on the wire)
+// 3: mutual handshake (nonces + proofs, no token on the wire)
+// 4: invalidation ops carry the change kind and a rename-pairing cookie
+inline constexpr std::uint16_t kVersion = 4;
 inline constexpr std::size_t kHeaderSize = 24;
 inline constexpr std::uint32_t kMaxPayload = 64u << 20;  // 64 MiB per frame
 
@@ -160,6 +162,10 @@ struct InvalidationOp {
   InvalidationKind kind;
   std::string path;  // normalised, '/'-separated, relative to the mount root
   Attributes attr;   // meaningful for Upsert only
+  // What the watcher saw, for peers that deliver change notifications rather
+  // than only mirroring metadata. Ignoring both fields leaves a peer correct.
+  ChangeKind change = ChangeKind::Unknown;
+  std::uint32_t cookie = 0;  // pairs the two halves of a move; 0 otherwise
 };
 
 struct InvalidationBatch {

@@ -1,4 +1,4 @@
-add_library(wsldrive_mount STATIC fuse_mount.cpp)
+add_library(wsldrive_mount STATIC fuse_mount.cpp fsnotify_bridge.cpp)
 add_library(wsldrive::mount ALIAS wsldrive_mount)
 
 # WSLDRIVE_HAVE_MOUNT is PUBLIC so the CLI enables the mount subcommand on either

@@ -198,6 +198,52 @@ TEST(Messages, InvalidationRoundTrip) {
   EXPECT_EQ(got->ops[1].path, "gone");
   EXPECT_EQ(got->ops[2].kind, InvalidationKind::Rescan);
   EXPECT_TRUE(r.empty());
+  for (const auto& op : got->ops) {
+    EXPECT_EQ(op.change, ChangeKind::Unknown);  // default when the sender says nothing
+    EXPECT_EQ(op.cookie, 0u);
+  }
+}
+
+TEST(Messages, InvalidationCarriesChangeKindAndMoveCookie) {
+  InvalidationBatch b;
+  b.generation = 7;
+  b.ops.push_back(InvalidationOp{InvalidationKind::Upsert, "made", kFile, ChangeKind::Created, 0});
+  b.ops.push_back(InvalidationOp{InvalidationKind::Upsert, "written", kFile, ChangeKind::Modified, 0});
+  b.ops.push_back(InvalidationOp{InvalidationKind::Remove, "old", {}, ChangeKind::MovedFrom, 4242});
+  b.ops.push_back(InvalidationOp{InvalidationKind::Upsert, "new", kFile, ChangeKind::MovedTo, 4242});
+  b.ops.push_back(InvalidationOp{InvalidationKind::Remove, "deleted", {}, ChangeKind::Removed, 0});
+
+  std::vector<std::byte> buf;
+  Writer w(buf);
+  write_invalidation(w, b);
+  Reader r(buf);
+  auto got = read_invalidation(r);
+  ASSERT_TRUE(got.has_value());
+  ASSERT_EQ(got->ops.size(), 5u);
+  EXPECT_EQ(got->ops[0].change, ChangeKind::Created);
+  EXPECT_EQ(got->ops[1].change, ChangeKind::Modified);
+  EXPECT_EQ(got->ops[2].change, ChangeKind::MovedFrom);
+  EXPECT_EQ(got->ops[3].change, ChangeKind::MovedTo);
+  EXPECT_EQ(got->ops[4].change, ChangeKind::Removed);
+  EXPECT_EQ(got->ops[2].cookie, 4242u);
+  EXPECT_EQ(got->ops[3].cookie, 4242u);
+  // The cookie rides along only for the two move kinds, so a batch without a
+  // move costs exactly one byte per op more than it used to.
+  EXPECT_EQ(got->ops[0].cookie, 0u);
+  EXPECT_EQ(got->ops[4].cookie, 0u);
+  EXPECT_TRUE(r.empty());
+}
+
+TEST(Messages, InvalidationRejectsAnUnknownChangeKind) {
+  std::vector<std::byte> buf;
+  Writer w(buf);
+  w.u64(1);       // generation
+  w.varint(1);    // one op
+  w.u8(static_cast<std::uint8_t>(InvalidationKind::Remove));
+  w.string("p");
+  w.u8(200);      // not a ChangeKind
+  Reader r(buf);
+  EXPECT_EQ(read_invalidation(r).error(), Errc::Corrupt);
 }
 
 TEST(Messages, HugeClaimedCountsFailWithoutHugeAllocation) {
